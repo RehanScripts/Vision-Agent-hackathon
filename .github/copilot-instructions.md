@@ -1,0 +1,8 @@
+- This is a Next.js App Router project with TypeScript and Tailwind CSS v4.
+- Use `"use client"` directive for components with interactivity, hooks, or Framer Motion.
+- All UI components live in `src/components/` and are modular and reusable.
+- Use the `cn()` utility from `src/lib/utils.ts` for combining class names.
+- Dark theme only — use the color system: bg `#0B0F19`, accent `#4F8CFF`, violet `#8B5CF6`.
+- Framer Motion is used for all animations. Use `as const` for ease tuples to satisfy TypeScript.
+- Dashboard pages use the `(dashboard)` route group which provides Sidebar + Topbar layout.
+- No backend logic — this is a UI-only project.
