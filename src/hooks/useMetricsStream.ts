@@ -7,6 +7,9 @@
  * - Session control (start/stop/demo)
  * - Connection state management
  * - Auto-reconnect with exponential backoff
+ *
+ * The AI agent joins a Stream Video call as a real participant.
+ * No base64 frame streaming — the agent receives media via Stream's edge.
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -48,9 +51,9 @@ export type SessionStatus = "idle" | "active" | "demo";
 export interface SystemStatus {
   sdk_active: boolean;
   multimodal_active: boolean;
+  agent_joined: boolean;
   inference_latency_ms: number;
   frames_processed: number;
-  frames_dropped: number;
   source: string;
 }
 
@@ -59,6 +62,8 @@ interface WebSocketMessage {
   /** Backend may send `data` or `payload` depending on event type */
   data?: Record<string, unknown>;
   payload?: Record<string, unknown>;
+  /** Error messages include a `message` field */
+  message?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +176,10 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
             );
             break;
 
+          case "error":
+            console.warn("⚠️ Server error:", message.message ?? message.data);
+            break;
+
           default:
             break;
         }
@@ -215,9 +224,14 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
 
   // -- Session Controls ------------------------------------------------------
 
-  const startSession = useCallback(() => {
+  const startSession = useCallback((callId?: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "start_session" }));
+      wsRef.current.send(
+        JSON.stringify({
+          type: "start_session",
+          ...(callId ? { call_id: callId } : {}),
+        })
+      );
     }
   }, []);
 
@@ -234,14 +248,11 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     }
   }, []);
 
-  // -- Send Frame ------------------------------------------------------------
+  // -- Send Frame (deprecated — agent gets frames from Stream call) ----------
 
-  const sendFrame = useCallback((base64Jpeg: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({ type: "frame", data: base64Jpeg })
-      );
-    }
+  const sendFrame = useCallback((_base64Jpeg: string) => {
+    // No-op: the AI agent receives video directly from the Stream Video call.
+    // This method is kept for backward-compatibility with CameraFeed.
   }, []);
 
   // -- Dismiss Feedback ------------------------------------------------------

@@ -2,15 +2,12 @@
 SpeakAI — Reasoning Engine
 
 Separated from the frame-processing hot path.
-Runs at a controlled cadence (every ~3 s), never per-frame.
+Runs at a controlled cadence (~3 s), never per-frame.
 
 Two layers:
   1. Threshold rules  — instant, zero-latency, always available.
-  2. SDK LLM reasoning — richer insight via Vision Agent's Gemini Realtime,
-     with hard async timeout + automatic fallback to rules on failure.
-
-The reasoning worker in session.py calls `engine.evaluate()` which handles
-cooldowns, timeouts, and fallback transparently.
+  2. SDK LLM reasoning — richer insight via Agent.llm.simple_response(),
+     with async timeout + automatic fallback to rules on failure.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ logger = logging.getLogger("speakai.reasoning")
 # ---------------------------------------------------------------------------
 
 class ThresholdFeedback:
-    """Fast rule-based coaching feedback with cooldown."""
+    """Fast rule-based coaching with cooldown."""
 
     THRESHOLDS = dict(
         eye_low=50.0, eye_good=80.0,
@@ -108,12 +105,12 @@ class ThresholdFeedback:
                 explanation=f"Eye {m.eye_contact:.0f}%, posture {m.posture_score:.0f}%.",
                 tip="Keep it up!",
             )
-        self._id -= 1  # undo — nothing to report
+        self._id -= 1
         return None
 
 
 # ---------------------------------------------------------------------------
-# Combined reasoning engine (LLM + fallback)
+# Combined reasoning engine (LLM first → rules fallback)
 # ---------------------------------------------------------------------------
 
 class ReasoningEngine:
@@ -121,11 +118,8 @@ class ReasoningEngine:
     Orchestrates coaching feedback at a controlled cadence.
 
     Priority:
-      1. Try SDK LLM reasoning (if processor supports it).
-      2. Fall back to threshold rules on timeout / failure / SDK unavailable.
-
-    NEVER blocks the frame processing loop — the session.py reasoning worker
-    calls `evaluate()` from its own asyncio.Task.
+      1. Try Agent.llm.simple_response() for rich insight.
+      2. Fall back to threshold rules on timeout / failure / no agent.
     """
 
     def __init__(
@@ -141,30 +135,39 @@ class ReasoningEngine:
     async def evaluate(
         self,
         metrics: SpeakingMetrics,
-        sdk_processor: Any,  # SDKVisionProcessor (if active)
+        agent: Any = None,  # Agent instance (if available)
     ) -> Optional[CoachingFeedback]:
         """
-        Produce coaching feedback.  Rate-limited by cooldown.
-        Returns None if cooldown hasn't elapsed.
+        Produce coaching feedback. Rate-limited by cooldown.
+        Tries SDK LLM first, then falls back to rules.
         """
         now = time.time()
         if now - self._last_call < self._cooldown:
             return None
         self._last_call = now
 
-        # Attempt LLM reasoning via SDK
-        if sdk_processor is not None and sdk_processor.is_active:
+        # Try LLM reasoning via the Agent
+        if agent is not None and hasattr(agent, "llm"):
             try:
-                text = await asyncio.wait_for(
-                    sdk_processor.get_llm_insight(metrics),
+                prompt = (
+                    f"Speaker metrics — eye contact {metrics.eye_contact:.0f}%, "
+                    f"head stability {metrics.head_stability:.0f}%, "
+                    f"posture {metrics.posture_score:.0f}%, "
+                    f"engagement {metrics.facial_engagement:.0f}%, "
+                    f"WPM {metrics.words_per_minute}. "
+                    "Give ONE short actionable coaching tip in ≤20 words."
+                )
+                response = await asyncio.wait_for(
+                    agent.llm.simple_response(prompt),
                     timeout=self._timeout,
                 )
-                if text:
+                text = getattr(response, "text", str(response))
+                if text and len(text.strip()) > 5:
                     return CoachingFeedback(
                         id=int(time.time() * 1000) % 100_000,
                         severity="info",
                         headline="AI Coach Insight",
-                        explanation=text,
+                        explanation=text.strip(),
                         tip=None,
                         source="llm",
                     )

@@ -3,33 +3,55 @@ SpeakAI — FastAPI Server
 
 ================================================================================
 Architecture:
-  • Per-WebSocket-session lifecycle (no global mutable agent state)
-  • Bounded frame queue with backpressure (drop-oldest, maxsize=3)
-  • Dedicated frame-processing worker per session
-  • Reasoning worker decoupled at ~3 s cadence
-  • System-status debug messages every 5 s
-  • Structured logging with session_id + latency telemetry
-  • All decode / inference / reasoning wrapped in try/except
+  • Per-WebSocket session backed by AIService (real Stream call participant)
+    or DemoService (simulated fallback)
+  • AIService creates a Vision Agent that joins a Stream Video call:
+      - Subscribes to participant audio + video tracks
+      - Processes frames via SpeakingCoachProcessor (VideoProcessorPublisher)
+      - Runs Gemini Realtime for multimodal understanding
+      - Publishes TTS audio responses back into the call
+  • No base64 frame hacks — the Agent uses Stream's edge media routing
+  • Structured metrics + feedback streamed to frontend over WebSocket
+  • System status debug messages every 5 s
 ================================================================================
 
 Endpoints:
-  WS  /ws/metrics        — real-time bi-directional session stream
-  GET /health            — server + session overview
-  GET /sessions          — list active sessions with telemetry
-  GET /session/{id}      — single session detail
+  WS  /ws/metrics           — real-time session stream
+  GET /health               — server health
+  GET /sessions             — list active sessions with telemetry
+  GET /session/{session_id} — single session detail
+
+Client → Server messages:
+  { type: "start_session", call_id: "..." }  → join a Stream call
+  { type: "start_demo" }                     → simulated metrics
+  { type: "stop_session" }                   → stop current service
+  { type: "ping" }                           → keepalive
+
+Server → Client messages:
+  { type: "metrics", data: {...} }           → per-frame metrics
+  { type: "feedback", data: {...} }          → coaching feedback
+  { type: "system_status", payload: {...} }  → debug telemetry
+  { type: "session_started", data: {...} }   → ack
+  { type: "session_stopped", data: {...} }   → ack + summary
+  { type: "demo_started", data: {...} }      → ack
+  { type: "pong" }                           → keepalive ack
+  { type: "error", message: "..." }          → error
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Dict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import server_cfg
-from session import SessionManager, CoachSession
+from config import server_cfg, sdk_cfg
+from ai_service import AIService, ServiceRegistry
+from demo_service import DemoService
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -42,10 +64,13 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------------
-# Session Manager (registry — not global agent state)
+# Service Registry
 # ---------------------------------------------------------------------------
 
-session_mgr = SessionManager()
+registry = ServiceRegistry()
+
+# Track demo services separately (they don't go through AIService)
+_demo_services: Dict[str, DemoService] = {}
 
 # ---------------------------------------------------------------------------
 # FastAPI Lifespan
@@ -55,9 +80,12 @@ session_mgr = SessionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 SpeakAI Backend starting...")
+    logger.info(f"   Stream keys configured: {sdk_cfg.has_all_keys}")
     yield
-    logger.info("🛑 Shutting down — closing all sessions...")
-    await session_mgr.close_all()
+    logger.info("🛑 Shutting down — closing all services...")
+    await registry.stop_all()
+    for sid in list(_demo_services.keys()):
+        await _demo_services.pop(sid).stop()
     logger.info("🛑 SpeakAI Backend stopped")
 
 
@@ -66,8 +94,13 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="SpeakAI — Public Speaking Coach API",
-    version="3.0.0",
+    title="SpeakAI — Real-Time AI Speaking Coach",
+    version="4.0.0",
+    description=(
+        "AI agent that joins Stream Video calls as a real participant, "
+        "analyses the speaker's video+audio via Vision Agents SDK, and "
+        "publishes spoken coaching responses back into the call."
+    ),
     lifespan=lifespan,
 )
 
@@ -88,41 +121,48 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
-        "active_sessions": session_mgr.active_count,
-        "version": "3.0.0",
+        "version": "4.0.0",
+        "sdk_keys_configured": sdk_cfg.has_all_keys,
+        "active_sessions": registry.active_count,
+        "active_demos": len(_demo_services),
     }
 
 
 @app.get("/sessions")
 async def list_sessions():
-    """List all active sessions with telemetry."""
-    result = {}
-    for sid, sess in session_mgr.all_sessions.items():
+    result: Dict[str, Any] = {}
+    for sid, svc in registry.all_services.items():
         result[sid] = {
-            "mode": sess._mode,
-            "active": sess._active,
-            "sdk_active": sess.telemetry.sdk_active,
-            "multimodal_active": sess.telemetry.multimodal_active,
-            "telemetry": sess.telemetry.to_dict(),
-            "latest_metrics": sess._latest_metrics.to_dict(),
+            "active": svc.is_active,
+            "telemetry": svc.telemetry.to_dict(),
+        }
+    for sid, demo in _demo_services.items():
+        result[sid] = {
+            "active": demo.is_active,
+            "mode": "demo",
+            "telemetry": demo.telemetry.to_dict(),
         }
     return result
 
 
 @app.get("/session/{session_id}")
 async def session_detail(session_id: str):
-    sess = session_mgr.get_session(session_id)
-    if sess is None:
-        return {"error": "session not found"}
-    return {
-        "session_id": session_id,
-        "mode": sess._mode,
-        "active": sess._active,
-        "sdk_active": sess.telemetry.sdk_active,
-        "multimodal_active": sess.telemetry.multimodal_active,
-        "telemetry": sess.telemetry.to_dict(),
-        "latest_metrics": sess._latest_metrics.to_dict(),
-    }
+    svc = registry.get(session_id)
+    if svc:
+        return {
+            "session_id": session_id,
+            "active": svc.is_active,
+            "telemetry": svc.telemetry.to_dict(),
+        }
+    demo = _demo_services.get(session_id)
+    if demo:
+        return {
+            "session_id": session_id,
+            "active": demo.is_active,
+            "mode": "demo",
+            "telemetry": demo.telemetry.to_dict(),
+        }
+    return {"error": "session not found"}
 
 
 # ---------------------------------------------------------------------------
@@ -132,30 +172,31 @@ async def session_detail(session_id: str):
 @app.websocket("/ws/metrics")
 async def websocket_metrics(ws: WebSocket):
     """
-    WebSocket endpoint — one CoachSession per connection.
-
-    Client messages:
-      { type: "start_session" }         → start live analysis
-      { type: "start_demo" }            → start simulated metrics
-      { type: "stop_session" }          → stop session
-      { type: "frame", data: "base64" } → send webcam frame
-      { type: "audio", data: "base64" } → send audio chunk (multimodal)
-      { type: "ping" }                  → keepalive
-
-    Server messages:
-      { type: "metrics", data: {...} }           → per-frame metrics
-      { type: "feedback", data: {...} }          → coaching feedback
-      { type: "system_status", payload: {...} }  → debug telemetry
-      { type: "session_started", data: {...} }   → ack
-      { type: "session_stopped", data: {...} }   → ack + summary
-      { type: "demo_started", data: {...} }      → ack
-      { type: "pong" }                           → keepalive ack
+    WebSocket endpoint — one AIService or DemoService per connection.
+    The AI agent joins a Stream Video call as a real participant.
+    Metrics and feedback are streamed back to the frontend.
     """
     await ws.accept()
 
-    # Create per-connection session
-    session: CoachSession = await session_mgr.create_session(ws)
-    session_id = session.session_id
+    session_id = uuid.uuid4().hex[:12]
+    current_service: Any = None  # AIService or DemoService
+
+    # Helper to send JSON safely
+    async def send(data: Dict[str, Any]) -> None:
+        try:
+            await ws.send_text(json.dumps(data))
+        except Exception:
+            pass
+
+    # Callbacks for AIService / DemoService
+    async def on_metrics(m: Any) -> None:
+        await send({"type": "metrics", "data": m.to_dict()})
+
+    async def on_feedback(fb: Any) -> None:
+        await send({"type": "feedback", "data": fb.to_dict()})
+
+    async def on_status(status: Dict[str, Any]) -> None:
+        await send({"type": "system_status", "payload": status})
 
     try:
         while True:
@@ -168,52 +209,86 @@ async def websocket_metrics(ws: WebSocket):
 
             msg_type = message.get("type", "")
 
-            # --- Frame: push to bounded queue (NEVER blocks) ---
-            if msg_type == "frame":
-                frame_data = message.get("data", "")
-                if frame_data and session._active:
-                    await session.enqueue_frame(frame_data)
+            # ── Start live session (AI agent joins a Stream call) ──
+            if msg_type == "start_session":
+                if current_service is not None:
+                    await send({"type": "error", "message": "Session already active"})
+                    continue
 
-            # --- Audio chunk: route to SDK if multimodal ---
-            elif msg_type == "audio":
-                # Future: route to SDK audio pipeline
-                pass
+                call_id = message.get("call_id", f"speakai-{session_id}")
 
-            # --- Start live session ---
-            elif msg_type == "start_session":
-                info = await session.start(mode="live")
-                await ws.send_text(json.dumps({
-                    "type": "session_started",
-                    "data": info,
-                }))
+                if not sdk_cfg.has_all_keys:
+                    await send({
+                        "type": "error",
+                        "message": "SDK keys not configured. Use demo mode instead.",
+                    })
+                    continue
 
-            # --- Start demo session ---
+                try:
+                    service = registry.create(
+                        session_id=session_id,
+                        on_metrics=on_metrics,
+                        on_feedback=on_feedback,
+                        on_status=on_status,
+                    )
+                    info = await service.start(call_id=call_id)
+                    current_service = service
+                    await send({"type": "session_started", "data": info})
+                except Exception as e:
+                    logger.error(f"[{session_id}] Failed to start AI service: {e}")
+                    await registry.stop_service(session_id)
+                    await send({
+                        "type": "error",
+                        "message": f"Failed to start AI agent: {str(e)[:100]}",
+                    })
+
+            # ── Start demo session ──
             elif msg_type == "start_demo":
-                info = await session.start(mode="demo")
-                await ws.send_text(json.dumps({
-                    "type": "demo_started",
-                    "data": info,
-                }))
+                if current_service is not None:
+                    await send({"type": "error", "message": "Session already active"})
+                    continue
 
-            # --- Stop session ---
+                demo = DemoService(
+                    session_id=session_id,
+                    on_metrics=on_metrics,
+                    on_feedback=on_feedback,
+                    on_status=on_status,
+                )
+                info = await demo.start()
+                _demo_services[session_id] = demo
+                current_service = demo
+                await send({"type": "demo_started", "data": info})
+
+            # ── Stop session ──
             elif msg_type == "stop_session":
-                summary = await session.stop()
-                await ws.send_text(json.dumps({
-                    "type": "session_stopped",
-                    "data": summary,
-                }))
+                if current_service is None:
+                    continue
 
-            # --- Keepalive ---
+                if isinstance(current_service, DemoService):
+                    summary = await current_service.stop()
+                    _demo_services.pop(session_id, None)
+                else:
+                    summary = await registry.stop_service(session_id) or {}
+
+                current_service = None
+                await send({"type": "session_stopped", "data": summary})
+
+            # ── Keepalive ──
             elif msg_type == "ping":
-                await ws.send_text(json.dumps({"type": "pong"}))
+                await send({"type": "pong"})
 
     except WebSocketDisconnect:
         logger.info(f"[{session_id}] WebSocket disconnected")
     except Exception as e:
         logger.error(f"[{session_id}] WebSocket error: {e}", exc_info=True)
     finally:
-        # Clean up session on disconnect
-        await session_mgr.close_session(session_id)
+        # Clean up on disconnect
+        if current_service is not None:
+            if isinstance(current_service, DemoService):
+                await current_service.stop()
+                _demo_services.pop(session_id, None)
+            else:
+                await registry.stop_service(session_id)
 
 
 # ---------------------------------------------------------------------------

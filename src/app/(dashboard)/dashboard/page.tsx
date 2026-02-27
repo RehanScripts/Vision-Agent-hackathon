@@ -231,7 +231,7 @@ export default function DashboardPage() {
           {!isSessionActive ? (
             <>
               <button
-                onClick={startSession}
+                onClick={() => startSession()}
                 disabled={connectionStatus !== "connected"}
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#4F8CFF]/15 text-[#4F8CFF] border border-[#4F8CFF]/20 hover:bg-[#4F8CFF]/25 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
               >
