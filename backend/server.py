@@ -1,137 +1,52 @@
 """
-SpeakAI — Vision Agent Backend Server
+SpeakAI — Vision Agent Backend Server (Refactored)
 
-FastAPI server that:
-1. Runs a Vision Agent using GetStream's edge network + Gemini VLM + YOLO Pose
-2. Processes webcam frames for public speaking metrics via MediaPipe
-3. Streams metrics to the Next.js frontend over WebSocket
-4. Generates coaching feedback in real-time
-
+================================================================================
 Architecture:
-  Browser ↔ GetStream WebRTC ↔ Vision Agent (Gemini + YOLO)
-  Browser ↔ WebSocket ↔ This Server (metrics + feedback)
-  Browser ↔ getUserMedia → WebSocket frames → MediaPipe analysis
+  - Per-WebSocket-session Vision Agent lifecycle (no global mutable state)
+  - Bounded frame queue with backpressure (drop-oldest, maxsize=3)
+  - Dedicated processing worker task per session
+  - Metrics at ~5 FPS, LLM reasoning decoupled at ~3 s cadence
+  - Structured logging with session_id and latency telemetry
+  - All frame decode / SDK inference / LLM calls wrapped in try/except
+================================================================================
+
+Endpoints:
+  WS /ws/metrics  — real-time bi-directional session stream
+  GET /health      — server + session overview
+  GET /sessions    — list active sessions with telemetry
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
 
-import cv2
-import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from speaking_coach_processor import (
-    SpeakingCoachAnalyzer,
-    FeedbackEngine,
-    MetricsBroadcaster,
-    SpeakingMetrics,
-    broadcaster,
-)
+from session_manager import SessionManager, VisionAgentSession
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logger = logging.getLogger("speakai")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 
 # ---------------------------------------------------------------------------
-# Global State
+# Global Session Manager (not mutable agent state — just a registry)
 # ---------------------------------------------------------------------------
 
-analyzer = SpeakingCoachAnalyzer(fps=5)
-feedback_engine = FeedbackEngine(cooldown_seconds=6.0)
-
-# Track session state
-session_state = {
-    "active": False,
-    "started_at": None,
-    "frame_count": 0,
-    "agent_status": "idle",  # idle | initializing | running | error
-}
-
-# Vision Agent reference (optional — when SDK is installed)
-vision_agent = None
-vision_agent_task = None
-
-
-# ---------------------------------------------------------------------------
-# Vision Agent Setup (optional — requires SDK + API keys)
-# ---------------------------------------------------------------------------
-
-async def try_start_vision_agent():
-    """Attempt to initialize the Vision Agents SDK agent."""
-    global vision_agent, session_state
-
-    try:
-        from vision_agents.core import Agent, User
-        from vision_agents.plugins import gemini, getstream, deepgram, elevenlabs
-
-        session_state["agent_status"] = "initializing"
-
-        agent = Agent(
-            edge=getstream.Edge(),
-            agent_user=User(
-                name="SpeakAI Coach",
-                id="speakai-coach",
-            ),
-            instructions=(
-                "You are an AI public speaking coach. Watch the user's video feed "
-                "and provide real-time coaching feedback on their:\n"
-                "- Eye contact and gaze direction\n"
-                "- Posture and body language\n"
-                "- Speaking pace and clarity\n"
-                "- Facial engagement and expression\n"
-                "- Head stability\n\n"
-                "Be encouraging but direct. Give short, actionable tips. "
-                "Focus on one improvement at a time."
-            ),
-            llm=gemini.Realtime(fps=2),
-            stt=deepgram.STT(eager_turn_detection=True),
-            tts=elevenlabs.TTS(model_id="eleven_flash_v2_5"),
-        )
-
-        vision_agent = agent
-        session_state["agent_status"] = "running"
-        logger.info("✅ Vision Agent initialized with Gemini Realtime + Deepgram + ElevenLabs")
-        return agent
-
-    except ImportError:
-        session_state["agent_status"] = "unavailable"
-        logger.info("ℹ️  Vision Agents SDK not installed — running in standalone metrics mode")
-        return None
-    except Exception as e:
-        session_state["agent_status"] = "error"
-        logger.error(f"❌ Vision Agent initialization failed: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Simulated Metrics Stream (fallback when no camera frames arrive)
-# ---------------------------------------------------------------------------
-
-async def simulated_metrics_loop():
-    """Generates simulated metrics for demo/testing purposes."""
-    logger.info("🎬 Starting simulated metrics stream")
-    while session_state["active"]:
-        metrics = analyzer._simulated_metrics()
-        await broadcaster.broadcast(metrics.to_dict())
-
-        # Check for feedback
-        feedback = feedback_engine.evaluate(metrics)
-        if feedback:
-            await broadcaster.broadcast_feedback(feedback)
-
-        await asyncio.sleep(0.2)  # 5 FPS
+session_mgr = SessionManager()
 
 
 # ---------------------------------------------------------------------------
@@ -140,22 +55,10 @@ async def simulated_metrics_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle."""
     logger.info("🚀 SpeakAI Backend starting...")
-    analyzer.initialize()
-
-    # Try starting Vision Agent (non-blocking)
-    asyncio.create_task(try_start_vision_agent())
-
     yield
-
-    # Cleanup
-    analyzer.close()
-    if vision_agent:
-        try:
-            await vision_agent.close()
-        except Exception:
-            pass
+    logger.info("🛑 Shutting down — closing all sessions...")
+    await session_mgr.close_all()
     logger.info("🛑 SpeakAI Backend stopped")
 
 
@@ -165,13 +68,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SpeakAI — Public Speaking Coach API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -186,153 +93,107 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
-        "agent_status": session_state["agent_status"],
-        "session_active": session_state["active"],
-        "frame_count": session_state["frame_count"],
-        "connected_clients": len(broadcaster._clients),
+        "active_sessions": session_mgr.active_count,
+        "uptime": "running",
     }
 
 
-@app.post("/session/start")
-async def start_session():
-    """Start a coaching session."""
-    global session_state
-    session_state["active"] = True
-    session_state["started_at"] = time.time()
-    session_state["frame_count"] = 0
-    logger.info("▶️  Session started")
-    return {"status": "started", "started_at": session_state["started_at"]}
-
-
-@app.post("/session/stop")
-async def stop_session():
-    """Stop the active coaching session."""
-    global session_state
-    duration = 0
-    if session_state["started_at"]:
-        duration = time.time() - session_state["started_at"]
-    session_state["active"] = False
-    session_state["started_at"] = None
-    logger.info(f"⏹️  Session stopped (duration: {duration:.1f}s)")
-    return {
-        "status": "stopped",
-        "duration_seconds": round(duration, 1),
-        "total_frames": session_state["frame_count"],
-    }
-
-
-@app.get("/session/status")
-async def session_status():
-    """Get current session status."""
-    duration = 0
-    if session_state["started_at"]:
-        duration = time.time() - session_state["started_at"]
-    return {
-        "active": session_state["active"],
-        "duration_seconds": round(duration, 1),
-        "frame_count": session_state["frame_count"],
-        "agent_status": session_state["agent_status"],
-        "latest_metrics": broadcaster.latest_metrics,
-    }
+@app.get("/sessions")
+async def list_sessions():
+    """List all active sessions with telemetry."""
+    result = {}
+    for sid, sess in session_mgr.all_sessions.items():
+        result[sid] = {
+            "agent_status": sess._agent_status,
+            "active": sess._active,
+            "log": sess.log.summary(),
+            "latest_metrics": sess.latest_metrics.to_dict(),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
-# WebSocket: Metrics Stream
+# WebSocket: Per-Session Metrics Stream
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/metrics")
 async def websocket_metrics(ws: WebSocket):
     """
-    WebSocket endpoint for real-time metrics streaming.
+    WebSocket endpoint — one VisionAgentSession per connection.
 
-    Client can:
-    - Receive metrics updates (type: "metrics")
-    - Receive feedback messages (type: "feedback")
-    - Send video frames as base64 JPEG (type: "frame")
-    - Send control commands (type: "start_session", "stop_session", "start_demo")
+    Client messages:
+      { type: "start_session" }         → start live analysis
+      { type: "start_demo" }            → start simulated metrics
+      { type: "stop_session" }          → stop session
+      { type: "frame", data: "base64" } → send webcam frame
+      { type: "ping" }                  → keepalive
+
+    Server messages:
+      { type: "metrics", data: {...} }          → metrics update (~5 FPS)
+      { type: "feedback", data: {...} }         → coaching feedback (rate-limited)
+      { type: "session_started", data: {...} }  → session started ack
+      { type: "session_stopped", data: {...} }  → session stopped ack + summary
+      { type: "demo_started", data: {...} }     → demo started ack
+      { type: "pong" }                          → keepalive response
     """
     await ws.accept()
-    broadcaster.register(ws)
+
+    # Create per-connection session
+    session: VisionAgentSession = await session_mgr.create_session(ws)
+    session_id = session.session_id
 
     try:
         while True:
-            data = await ws.receive_text()
-            message = json.loads(data)
+            raw = await ws.receive_text()
+
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
             msg_type = message.get("type", "")
 
+            # --- Frame: push to bounded queue (NEVER blocks) ---
             if msg_type == "frame":
-                # Process incoming video frame
-                await _handle_frame(message, ws)
+                frame_data = message.get("data", "")
+                if frame_data and session._active:
+                    await session.enqueue_frame(frame_data)
 
+            # --- Start live session ---
             elif msg_type == "start_session":
-                session_state["active"] = True
-                session_state["started_at"] = time.time()
-                session_state["frame_count"] = 0
+                await session.start(mode="live")
                 await ws.send_text(json.dumps({
                     "type": "session_started",
-                    "data": {"started_at": session_state["started_at"]},
+                    "data": {"session_id": session_id, "mode": "live"},
                 }))
 
-            elif msg_type == "stop_session":
-                session_state["active"] = False
-                await ws.send_text(json.dumps({
-                    "type": "session_stopped",
-                    "data": {"frame_count": session_state["frame_count"]},
-                }))
-
+            # --- Start demo session ---
             elif msg_type == "start_demo":
-                # Start simulated metrics for demo mode
-                session_state["active"] = True
-                session_state["started_at"] = time.time()
-                asyncio.create_task(simulated_metrics_loop())
+                await session.start(mode="demo")
                 await ws.send_text(json.dumps({
                     "type": "demo_started",
-                    "data": {"mode": "simulated"},
+                    "data": {"session_id": session_id, "mode": "simulated"},
                 }))
 
+            # --- Stop session ---
+            elif msg_type == "stop_session":
+                summary = await session.stop()
+                await ws.send_text(json.dumps({
+                    "type": "session_stopped",
+                    "data": summary,
+                }))
+
+            # --- Keepalive ---
             elif msg_type == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
 
     except WebSocketDisconnect:
-        logger.info("🔌 WebSocket client disconnected")
+        logger.info(f"[{session_id}] WebSocket disconnected")
     except Exception as e:
-        logger.error(f"❌ WebSocket error: {e}")
+        logger.error(f"[{session_id}] WebSocket error: {e}", exc_info=True)
     finally:
-        broadcaster.unregister(ws)
-
-
-async def _handle_frame(message: dict, ws: WebSocket):
-    """Decode base64 JPEG frame, analyze, broadcast metrics."""
-    try:
-        frame_data = message.get("data", "")
-        if not frame_data:
-            return
-
-        # Decode base64 → numpy array
-        img_bytes = base64.b64decode(frame_data)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if frame_bgr is None:
-            return
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        # Analyze frame
-        session_state["frame_count"] += 1
-        metrics = await analyzer.analyze_frame(frame_rgb)
-
-        # Broadcast metrics to all clients
-        await broadcaster.broadcast(metrics.to_dict())
-
-        # Generate feedback if thresholds breached
-        feedback = feedback_engine.evaluate(metrics)
-        if feedback:
-            await broadcaster.broadcast_feedback(feedback)
-
-    except Exception as e:
-        logger.error(f"❌ Frame processing error: {e}")
+        # Clean up session on disconnect
+        await session_mgr.close_session(session_id)
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,9 @@ export type SessionStatus = "idle" | "active" | "demo";
 
 interface WebSocketMessage {
   type: string;
-  data: Record<string, unknown>;
+  /** Backend may send `data` or `payload` depending on event type */
+  data?: Record<string, unknown>;
+  payload?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +123,16 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
 
         switch (message.type) {
           case "metrics":
-            setMetrics(message.data as unknown as SpeakingMetrics);
+          case "metrics_update":
+            setMetrics(
+              (message.payload ?? message.data) as unknown as SpeakingMetrics
+            );
             break;
 
-          case "feedback": {
-            const fb = message.data as unknown as CoachingFeedback;
+          case "feedback":
+          case "feedback_update": {
+            const fb = (message.payload ??
+              message.data) as unknown as CoachingFeedback;
             setFeedback(fb);
             setFeedbackHistory((prev) => [fb, ...prev].slice(0, 50));
             break;

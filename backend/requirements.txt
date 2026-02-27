@@ -10,3 +10,5 @@ python-dotenv
 opencv-python-headless
 numpy
 mediapipe
+# AV for video frame conversion (used by SDK internally)
+av
