@@ -44,6 +44,16 @@ export type ConnectionStatus =
 
 export type SessionStatus = "idle" | "active" | "demo";
 
+/** Debug telemetry sent by the backend every ~5 s */
+export interface SystemStatus {
+  sdk_active: boolean;
+  multimodal_active: boolean;
+  inference_latency_ms: number;
+  frames_processed: number;
+  frames_dropped: number;
+  source: string;
+}
+
 interface WebSocketMessage {
   type: string;
   /** Backend may send `data` or `payload` depending on event type */
@@ -89,6 +99,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("disconnected");
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempts = useRef(0);
@@ -152,6 +163,12 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
 
           case "pong":
             // keepalive ack
+            break;
+
+          case "system_status":
+            setSystemStatus(
+              (message.payload ?? message.data) as unknown as SystemStatus
+            );
             break;
 
           default:
@@ -252,6 +269,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     feedbackHistory,
     connectionStatus,
     sessionStatus,
+    systemStatus,
 
     // Actions
     connect,
