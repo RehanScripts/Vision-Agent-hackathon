@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { useRouter } from "next/navigation";
 import GlassCard from "@/components/ui/GlassCard";
 import Badge from "@/components/ui/Badge";
 import {
@@ -71,6 +72,16 @@ const fadeUp = {
 };
 
 export default function PracticePage() {
+  const router = useRouter();
+
+  const handleQuickStart = () => {
+    router.push("/dashboard?type=Free+Practice&autostart=demo");
+  };
+
+  const handleScenario = (title: string) => {
+    router.push(`/dashboard?type=${encodeURIComponent(title)}&autostart=demo`);
+  };
+
   return (
     <motion.div
       variants={container}
@@ -111,6 +122,7 @@ export default function PracticePage() {
               <motion.button
                 whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.98 }}
+                onClick={handleQuickStart}
                 className="px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-[#4F8CFF] to-[#8B5CF6] text-white shadow-lg shadow-[#4F8CFF]/20"
               >
                 Start Now
@@ -159,6 +171,7 @@ export default function PracticePage() {
                     <motion.button
                       whileHover={{ scale: 1.05 }}
                       whileTap={{ scale: 0.95 }}
+                      onClick={() => handleScenario(scenario.title)}
                       className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white/[0.05] border border-white/[0.08] text-white/60 hover:text-white hover:bg-white/[0.08] transition-all"
                     >
                       <Target className="w-3 h-3" />

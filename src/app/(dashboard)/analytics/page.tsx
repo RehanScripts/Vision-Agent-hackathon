@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
@@ -7,6 +8,7 @@ import Badge from "@/components/ui/Badge";
 import PerformanceChart from "@/components/analytics/PerformanceChart";
 import {
   TrendingUp,
+  TrendingDown,
   Eye,
   Gauge,
   MessageCircleWarning,
@@ -15,44 +17,9 @@ import {
   Target,
   Clock,
   Award,
+  BarChart3,
 } from "lucide-react";
-
-const statCards = [
-  {
-    label: "Avg. WPM",
-    value: 138,
-    icon: Gauge,
-    color: "#4F8CFF",
-    trend: "+5%",
-    trendUp: true,
-  },
-  {
-    label: "Avg. Eye Contact",
-    value: 85,
-    suffix: "%",
-    icon: Eye,
-    color: "#22C55E",
-    trend: "+12%",
-    trendUp: true,
-  },
-  {
-    label: "Filler Words / Min",
-    value: 2,
-    icon: MessageCircleWarning,
-    color: "#F59E0B",
-    trend: "-40%",
-    trendUp: true,
-  },
-  {
-    label: "Posture Score",
-    value: 91,
-    suffix: "%",
-    icon: PersonStanding,
-    color: "#8B5CF6",
-    trend: "+8%",
-    trendUp: true,
-  },
-];
+import { computeAnalytics, AnalyticsOverview } from "@/lib/sessionStore";
 
 const container = {
   hidden: {},
@@ -65,6 +32,58 @@ const fadeUp = {
 };
 
 export default function AnalyticsPage() {
+  const [analytics, setAnalytics] = useState<AnalyticsOverview | null>(null);
+
+  useEffect(() => {
+    setAnalytics(computeAnalytics());
+  }, []);
+
+  const statCards = useMemo(() => {
+    if (!analytics) return [];
+    return [
+      {
+        label: "Avg. WPM",
+        value: analytics.avgWPM,
+        icon: Gauge,
+        color: "#4F8CFF",
+      },
+      {
+        label: "Avg. Eye Contact",
+        value: analytics.avgEyeContact,
+        suffix: "%",
+        icon: Eye,
+        color: "#22C55E",
+      },
+      {
+        label: "Filler Words / Min",
+        value: analytics.avgFillerWords,
+        icon: MessageCircleWarning,
+        color: "#F59E0B",
+      },
+      {
+        label: "Posture Score",
+        value: analytics.avgPosture,
+        suffix: "%",
+        icon: PersonStanding,
+        color: "#8B5CF6",
+      },
+    ];
+  }, [analytics]);
+
+  const chartData = useMemo(() => {
+    if (!analytics || analytics.trend.length === 0) return undefined;
+    return analytics.trend.map((t) => ({
+      time: `Session ${t.index + 1}`,
+      wpm: t.wpm,
+      eyeContact: t.eyeContact,
+      posture: t.posture,
+    }));
+  }, [analytics]);
+
+  const hasSessions = analytics !== null && analytics.totalSessions > 0;
+  const scoreChangePositive = (analytics?.scoreChange ?? 0) >= 0;
+  const hoursTotal = analytics ? (analytics.totalMinutes / 60).toFixed(1) : "0";
+
   return (
     <motion.div
       variants={container}
@@ -84,121 +103,151 @@ export default function AnalyticsPage() {
             </div>
             <div className="relative">
               <AnimatedNumber
-                value={87}
+                value={hasSessions ? analytics.avgScore : 0}
                 className="text-7xl font-bold bg-gradient-to-b from-white to-white/50 bg-clip-text text-transparent"
               />
               <span className="text-2xl font-bold text-white/30 ml-1">/100</span>
             </div>
-            <div className="flex items-center gap-2 mt-3">
-              <Badge variant="green" pulse>
-                <TrendingUp className="w-3 h-3" />
-                +5 from last session
-              </Badge>
-            </div>
+            {hasSessions && analytics.scoreChange !== 0 && (
+              <div className="flex items-center gap-2 mt-3">
+                <Badge variant={scoreChangePositive ? "green" : "warning"} pulse>
+                  {scoreChangePositive ? (
+                    <TrendingUp className="w-3 h-3" />
+                  ) : (
+                    <TrendingDown className="w-3 h-3" />
+                  )}
+                  {scoreChangePositive ? "+" : ""}
+                  {analytics.scoreChange} from recent sessions
+                </Badge>
+              </div>
+            )}
             <div className="flex items-center gap-6 mt-6 text-xs text-white/40">
               <div className="flex items-center gap-1.5">
                 <Target className="w-3.5 h-3.5" />
-                <span>47 sessions analyzed</span>
+                <span>{analytics?.totalSessions ?? 0} sessions analyzed</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <Clock className="w-3.5 h-3.5" />
-                <span>12.5 hours total</span>
+                <span>{hoursTotal} hours total</span>
               </div>
             </div>
           </div>
         </GlassCard>
       </motion.div>
+
+      {/* No data state */}
+      {!hasSessions && (
+        <motion.div variants={fadeUp}>
+          <GlassCard className="p-12 text-center">
+            <BarChart3 className="w-8 h-8 text-white/20 mx-auto mb-4" />
+            <h3 className="text-sm font-medium text-white/50 mb-1">No analytics data yet</h3>
+            <p className="text-xs text-white/30">
+              Complete a practice session to see your performance analytics.
+            </p>
+          </GlassCard>
+        </motion.div>
+      )}
 
       {/* Stat Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {statCards.map((stat, i) => (
-          <motion.div key={stat.label} variants={fadeUp}>
-            <GlassCard className="p-5">
-              <div className="flex items-start justify-between mb-3">
-                <div
-                  className="w-10 h-10 rounded-xl flex items-center justify-center"
-                  style={{ backgroundColor: `${stat.color}15` }}
-                >
-                  <stat.icon
-                    className="w-5 h-5"
-                    style={{ color: stat.color }}
+      {hasSessions && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {statCards.map((stat) => (
+            <motion.div key={stat.label} variants={fadeUp}>
+              <GlassCard className="p-5">
+                <div className="flex items-start justify-between mb-3">
+                  <div
+                    className="w-10 h-10 rounded-xl flex items-center justify-center"
+                    style={{ backgroundColor: `${stat.color}15` }}
+                  >
+                    <stat.icon
+                      className="w-5 h-5"
+                      style={{ color: stat.color }}
+                    />
+                  </div>
+                </div>
+                <div className="flex items-baseline gap-1">
+                  <AnimatedNumber
+                    value={stat.value}
+                    className="text-3xl font-bold tracking-tight"
+                    suffix={stat.suffix}
                   />
+                  {stat.suffix && (
+                    <span className="text-sm text-white/40 font-medium">
+                      {stat.suffix}
+                    </span>
+                  )}
                 </div>
-                <div
-                  className={`flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg ${
-                    stat.trendUp
-                      ? "text-[#22C55E] bg-[#22C55E]/10"
-                      : "text-[#EF4444] bg-[#EF4444]/10"
-                  }`}
-                >
-                  <TrendingUp className="w-3 h-3" />
-                  {stat.trend}
-                </div>
-              </div>
-              <div className="flex items-baseline gap-1">
-                <AnimatedNumber
-                  value={stat.value}
-                  className="text-3xl font-bold tracking-tight"
-                  suffix={stat.suffix}
-                />
-                {stat.suffix && (
-                  <span className="text-sm text-white/40 font-medium">
-                    {stat.suffix}
-                  </span>
-                )}
-              </div>
-              <p className="text-sm text-white/50 mt-1">{stat.label}</p>
-            </GlassCard>
-          </motion.div>
-        ))}
-      </div>
+                <p className="text-sm text-white/50 mt-1">{stat.label}</p>
+              </GlassCard>
+            </motion.div>
+          ))}
+        </div>
+      )}
 
       {/* Performance Chart */}
-      <motion.div variants={fadeUp}>
-        <PerformanceChart />
-      </motion.div>
+      {hasSessions && (
+        <motion.div variants={fadeUp}>
+          <PerformanceChart
+            data={chartData}
+            subtitle={`Across last ${analytics.trend.length} sessions`}
+          />
+        </motion.div>
+      )}
 
       {/* AI Summary */}
-      <motion.div variants={fadeUp}>
-        <GlassCard className="p-6" hover={false} glow="violet">
-          <div className="flex items-start gap-4">
-            <div className="flex-shrink-0 w-10 h-10 rounded-xl bg-[#8B5CF6]/10 border border-[#8B5CF6]/20 flex items-center justify-center">
-              <Sparkles className="w-5 h-5 text-[#8B5CF6]" />
-            </div>
-            <div className="flex-1">
-              <h3 className="text-base font-semibold text-white/90 mb-2">
-                AI Performance Summary
-              </h3>
-              <div className="space-y-3 text-sm text-white/50 leading-relaxed">
-                <p>
-                  Your speaking pace has improved significantly over the last 10
-                  sessions, stabilizing around 135-145 WPM — well within the
-                  optimal range for presentations.
-                </p>
-                <p>
-                  <span className="text-[#22C55E] font-medium">Strength:</span>{" "}
-                  Eye contact consistency has reached 85%, placing you in the top
-                  15% of all users.
-                </p>
-                <p>
-                  <span className="text-[#F59E0B] font-medium">
-                    Area to improve:
-                  </span>{" "}
-                  Filler word usage tends to spike during the first 30 seconds.
-                  Consider opening with a practiced statement.
-                </p>
-                <p>
-                  <span className="text-[#8B5CF6] font-medium">
-                    Recommendation:
-                  </span>{" "}
-                  Try a 5-minute Interview Practice session focusing on
-                  eliminating opening fillers.
-                </p>
+      {hasSessions && (
+        <motion.div variants={fadeUp}>
+          <GlassCard className="p-6" hover={false} glow="violet">
+            <div className="flex items-start gap-4">
+              <div className="flex-shrink-0 w-10 h-10 rounded-xl bg-[#8B5CF6]/10 border border-[#8B5CF6]/20 flex items-center justify-center">
+                <Sparkles className="w-5 h-5 text-[#8B5CF6]" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-base font-semibold text-white/90 mb-2">
+                  AI Performance Summary
+                </h3>
+                <div className="space-y-3 text-sm text-white/50 leading-relaxed">
+                  <p>
+                    Based on <span className="text-white/80 font-medium">{analytics.totalSessions} sessions</span> totaling{" "}
+                    <span className="text-white/80 font-medium">{analytics.totalMinutes} minutes</span> of practice,
+                    your average score is <span className="text-white/80 font-medium">{analytics.avgScore}/100</span>.
+                  </p>
+                  {analytics.avgEyeContact >= 75 ? (
+                    <p>
+                      <span className="text-[#22C55E] font-medium">Strength:</span>{" "}
+                      Eye contact consistency is at {analytics.avgEyeContact}% — excellent engagement.
+                    </p>
+                  ) : (
+                    <p>
+                      <span className="text-[#F59E0B] font-medium">Area to improve:</span>{" "}
+                      Eye contact is at {analytics.avgEyeContact}%. Try focusing on looking into the camera more consistently.
+                    </p>
+                  )}
+                  {analytics.avgFillerWords <= 3 ? (
+                    <p>
+                      <span className="text-[#22C55E] font-medium">Strength:</span>{" "}
+                      Filler word usage is low at ~{analytics.avgFillerWords}/min. Great verbal control!
+                    </p>
+                  ) : (
+                    <p>
+                      <span className="text-[#F59E0B] font-medium">Area to improve:</span>{" "}
+                      Filler word usage is ~{analytics.avgFillerWords}/min. Try pausing instead of using fillers.
+                    </p>
+                  )}
+                  <p>
+                    <span className="text-[#8B5CF6] font-medium">Recommendation:</span>{" "}
+                    {analytics.avgWPM > 160
+                      ? "Your pace tends to run fast. Try slowing down by 10-15% for better clarity."
+                      : analytics.avgWPM < 110
+                        ? "Your pace is on the slower side. Try increasing energy and speaking with more momentum."
+                        : "Your speaking pace is in the optimal range. Keep up the consistent practice!"}
+                  </p>
+                </div>
               </div>
             </div>
-          </div>
-        </GlassCard>
-      </motion.div>
+          </GlassCard>
+        </motion.div>
+      )}
     </motion.div>
   );
 }

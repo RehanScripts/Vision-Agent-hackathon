@@ -1,13 +1,15 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useCallback, useEffect } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import CameraFeed from "@/components/dashboard/CameraFeed";
 import FeedbackPanel from "@/components/dashboard/FeedbackPanel";
 import MetricCard from "@/components/ui/MetricCard";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
 import { useMetricsStream } from "@/hooks/useMetricsStream";
+import { addSession, type StoredSession, type SessionMetricsSnapshot } from "@/lib/sessionStore";
 import {
   Gauge,
   Eye,
@@ -163,7 +165,18 @@ const fadeUp = {
   show: { opacity: 1, y: 0, transition: { duration: 0.5, ease: [0.25, 0.1, 0.25, 1] as const } },
 };
 
-export default function DashboardPage() {
+export default function DashboardPageWrapper() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-64 text-white/30 text-sm">Loading dashboard…</div>}>
+      <DashboardPage />
+    </Suspense>
+  );
+}
+
+function DashboardPage() {
+  const searchParams = useSearchParams();
+  const scenarioType = searchParams.get("type") || "Free Practice";
+
   const {
     metrics,
     feedback,
@@ -182,12 +195,110 @@ export default function DashboardPage() {
     connect();
   }, [connect]);
 
+  // -- Session tracking for persistence --
+  const sessionStartRef = useRef<number | null>(null);
+  const timelineRef = useRef<Array<{ time: number; metrics: SessionMetricsSnapshot }>>([]);
+  const lastSnapshotRef = useRef<number>(0);
+  const [sessionLabel, setSessionLabel] = useState(scenarioType);
+
+  // Update label when query param changes
+  useEffect(() => {
+    setSessionLabel(searchParams.get("type") || "Free Practice");
+  }, [searchParams]);
+
+  // Accumulate timeline snapshots every 30s during active session
+  useEffect(() => {
+    if (sessionStatus === "idle") return;
+
+    const snap = (): SessionMetricsSnapshot => ({
+      eye_contact: metrics.eye_contact,
+      head_stability: metrics.head_stability,
+      posture_score: metrics.posture_score,
+      facial_engagement: metrics.facial_engagement,
+      attention_intensity: metrics.attention_intensity,
+      filler_words: metrics.filler_words,
+      words_per_minute: metrics.words_per_minute,
+    });
+
+    const now = Date.now();
+    if (sessionStartRef.current === null) {
+      sessionStartRef.current = now;
+      timelineRef.current = [{ time: 0, metrics: snap() }];
+      lastSnapshotRef.current = now;
+    } else if (now - lastSnapshotRef.current >= 30_000) {
+      timelineRef.current.push({
+        time: Math.round((now - sessionStartRef.current) / 1000),
+        metrics: snap(),
+      });
+      lastSnapshotRef.current = now;
+    }
+  }, [metrics, sessionStatus]);
+
+  // Save session when it stops
+  const handleStop = useCallback(() => {
+    // Capture final metrics before stopping
+    const durationSeconds = sessionStartRef.current
+      ? Math.round((Date.now() - sessionStartRef.current) / 1000)
+      : 0;
+
+    const finalSnap: SessionMetricsSnapshot = {
+      eye_contact: metrics.eye_contact,
+      head_stability: metrics.head_stability,
+      posture_score: metrics.posture_score,
+      facial_engagement: metrics.facial_engagement,
+      attention_intensity: metrics.attention_intensity,
+      filler_words: metrics.filler_words,
+      words_per_minute: metrics.words_per_minute,
+    };
+
+    const compositeScore = Math.round(
+      (metrics.eye_contact +
+        metrics.posture_score +
+        metrics.head_stability +
+        metrics.facial_engagement) /
+        4
+    );
+
+    if (durationSeconds > 3) {
+      const stored: StoredSession = {
+        id: crypto.randomUUID(),
+        title: `${sessionLabel} Session`,
+        type: sessionLabel,
+        date: new Date().toISOString(),
+        durationSeconds,
+        score: compositeScore,
+        metrics: finalSnap,
+        timeline: timelineRef.current,
+      };
+      addSession(stored);
+    }
+
+    // Reset tracking
+    sessionStartRef.current = null;
+    timelineRef.current = [];
+    lastSnapshotRef.current = 0;
+
+    stopSession();
+  }, [metrics, sessionLabel, stopSession]);
+
   const handleFrame = useCallback(
     (base64Jpeg: string) => {
       sendFrame(base64Jpeg);
     },
     [sendFrame]
   );
+
+  // Auto-start demo if query param says so
+  useEffect(() => {
+    if (searchParams.get("autostart") === "demo" && connectionStatus === "connected" && sessionStatus === "idle") {
+      startDemo();
+    }
+    if (searchParams.get("autostart") === "live" && connectionStatus === "connected" && sessionStatus === "idle") {
+      startSession();
+    }
+    // Only run once when connected
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectionStatus]);
 
   const isSessionActive = sessionStatus !== "idle";
 
@@ -247,7 +358,7 @@ export default function DashboardPage() {
             </>
           ) : (
             <button
-              onClick={stopSession}
+              onClick={handleStop}
               className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#EF4444]/15 text-[#EF4444] border border-[#EF4444]/20 hover:bg-[#EF4444]/25 transition-colors"
             >
               <Square className="w-3.5 h-3.5" /> Stop Session

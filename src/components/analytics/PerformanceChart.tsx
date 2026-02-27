@@ -13,7 +13,7 @@ import {
 } from "recharts";
 import GlassCard from "@/components/ui/GlassCard";
 
-const data = [
+const defaultData = [
   { time: "0:00", wpm: 120, eyeContact: 70, posture: 80 },
   { time: "0:30", wpm: 135, eyeContact: 75, posture: 82 },
   { time: "1:00", wpm: 145, eyeContact: 65, posture: 85 },
@@ -26,6 +26,18 @@ const data = [
   { time: "4:30", wpm: 138, eyeContact: 87, posture: 93 },
   { time: "5:00", wpm: 130, eyeContact: 91, posture: 95 },
 ];
+
+interface ChartDataPoint {
+  time: string;
+  wpm: number;
+  eyeContact: number;
+  posture: number;
+}
+
+interface PerformanceChartProps {
+  data?: ChartDataPoint[];
+  subtitle?: string;
+}
 
 interface CustomTooltipProps {
   active?: boolean;
@@ -61,7 +73,9 @@ const CustomTooltip = ({ active, payload, label }: CustomTooltipProps) => {
   return null;
 };
 
-export default function PerformanceChart() {
+export default function PerformanceChart({ data, subtitle }: PerformanceChartProps) {
+  const chartData = data && data.length > 0 ? data : defaultData;
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
@@ -75,7 +89,7 @@ export default function PerformanceChart() {
               Performance Over Time
             </h3>
             <p className="text-xs text-white/40 mt-1">
-              Real-time session metrics
+              {subtitle || "Real-time session metrics"}
             </p>
           </div>
           <div className="flex items-center gap-4">
@@ -96,7 +110,7 @@ export default function PerformanceChart() {
         <div className="h-[300px] w-full">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart
-              data={data}
+              data={chartData}
               margin={{ top: 5, right: 5, left: -20, bottom: 5 }}
             >
               <CartesianGrid

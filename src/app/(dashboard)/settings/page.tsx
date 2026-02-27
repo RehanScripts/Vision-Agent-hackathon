@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import GlassCard from "@/components/ui/GlassCard";
 import Badge from "@/components/ui/Badge";
 import {
@@ -13,6 +13,7 @@ import {
   ChevronDown,
   Check,
 } from "lucide-react";
+import { getSettings, saveSettings, UserSettings } from "@/lib/sessionStore";
 
 function Toggle({
   enabled,
@@ -103,7 +104,17 @@ export default function SettingsPage() {
   const [sessionType, setSessionType] = useState("Interview");
   const [saved, setSaved] = useState(false);
 
+  // Load persisted settings on mount
+  useEffect(() => {
+    const s = getSettings();
+    setCameraPreview(s.cameraPreview);
+    setInterruptions(s.interruptions);
+    setDarkMode(s.darkMode);
+    setSessionType(s.sessionType);
+  }, []);
+
   const handleSave = () => {
+    saveSettings({ cameraPreview, interruptions, darkMode, sessionType });
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
