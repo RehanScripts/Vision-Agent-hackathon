@@ -1,15 +1,23 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { useCallback, useEffect } from "react";
 import CameraFeed from "@/components/dashboard/CameraFeed";
+import FeedbackPanel from "@/components/dashboard/FeedbackPanel";
 import MetricCard from "@/components/ui/MetricCard";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
+import { useMetricsStream } from "@/hooks/useMetricsStream";
 import {
   Gauge,
   Eye,
   MessageCircleWarning,
   PersonStanding,
+  Play,
+  Square,
+  Radio,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 
 // Semi-circle gauge component
@@ -156,6 +164,39 @@ const fadeUp = {
 };
 
 export default function DashboardPage() {
+  const {
+    metrics,
+    feedback,
+    connectionStatus,
+    sessionStatus,
+    connect,
+    startSession,
+    stopSession,
+    startDemo,
+    sendFrame,
+    dismissFeedback,
+  } = useMetricsStream({ url: "ws://localhost:8080/ws/metrics" });
+
+  // Auto-connect on mount
+  useEffect(() => {
+    connect();
+  }, [connect]);
+
+  const handleFrame = useCallback(
+    (base64Jpeg: string) => {
+      sendFrame(base64Jpeg);
+    },
+    [sendFrame]
+  );
+
+  const isSessionActive = sessionStatus !== "idle";
+
+  // Derive trend helpers (simple: compare to baseline or show neutral)
+  const eyeTrend = metrics.eye_contact >= 70 ? ("up" as const) : ("down" as const);
+  const postureTrend = metrics.posture_score >= 80 ? ("up" as const) : ("down" as const);
+  const fillerTrend = metrics.filler_words <= 3 ? ("down" as const) : ("up" as const);
+  const wpmTrend = metrics.words_per_minute >= 120 && metrics.words_per_minute <= 160 ? ("up" as const) : ("down" as const);
+
   return (
     <motion.div
       variants={container}
@@ -163,10 +204,67 @@ export default function DashboardPage() {
       animate="show"
       className="space-y-6"
     >
+      {/* Session Control Bar */}
+      <motion.div variants={fadeUp} className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            {connectionStatus === "connected" ? (
+              <Wifi className="w-4 h-4 text-[#22C55E]" />
+            ) : connectionStatus === "reconnecting" ? (
+              <WifiOff className="w-4 h-4 text-[#F59E0B] animate-pulse" />
+            ) : (
+              <WifiOff className="w-4 h-4 text-white/30" />
+            )}
+            <span className="text-xs text-white/40 capitalize">{connectionStatus}</span>
+          </div>
+          {isSessionActive && (
+            <div className="flex items-center gap-1.5">
+              <Radio className="w-3 h-3 text-[#EF4444] animate-pulse" />
+              <span className="text-xs text-white/50 uppercase tracking-wider font-medium">
+                {sessionStatus === "demo" ? "Demo Mode" : "Live Session"}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          {!isSessionActive ? (
+            <>
+              <button
+                onClick={startSession}
+                disabled={connectionStatus !== "connected"}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#4F8CFF]/15 text-[#4F8CFF] border border-[#4F8CFF]/20 hover:bg-[#4F8CFF]/25 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <Play className="w-3.5 h-3.5" /> Start Session
+              </button>
+              <button
+                onClick={startDemo}
+                disabled={connectionStatus !== "connected"}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#8B5CF6]/15 text-[#8B5CF6] border border-[#8B5CF6]/20 hover:bg-[#8B5CF6]/25 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <Radio className="w-3.5 h-3.5" /> Demo Mode
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={stopSession}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#EF4444]/15 text-[#EF4444] border border-[#EF4444]/20 hover:bg-[#EF4444]/25 transition-colors"
+            >
+              <Square className="w-3.5 h-3.5" /> Stop Session
+            </button>
+          )}
+        </div>
+      </motion.div>
+
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Camera Feed - Left Column */}
         <motion.div variants={fadeUp} className="lg:col-span-3">
-          <CameraFeed />
+          <CameraFeed
+            connectionStatus={connectionStatus}
+            sessionStatus={sessionStatus}
+            onFrame={handleFrame}
+            streaming={isSessionActive}
+          />
         </motion.div>
 
         {/* Metrics - Right Column */}
@@ -175,14 +273,14 @@ export default function DashboardPage() {
           <motion.div variants={fadeUp}>
             <MetricCard
               label="Words Per Minute"
-              value={142}
+              value={Math.round(metrics.words_per_minute)}
               suffix="WPM"
-              trend="up"
-              trendValue="+8%"
+              trend={wpmTrend}
+              trendValue={wpmTrend === "up" ? "Good pace" : "Adjust pace"}
               icon={<Gauge className="w-5 h-5" />}
               color="blue"
             >
-              <SemiCircleGauge value={142} max={200} color="#4F8CFF" />
+              <SemiCircleGauge value={metrics.words_per_minute} max={200} color="#4F8CFF" />
             </MetricCard>
           </motion.div>
 
@@ -190,14 +288,14 @@ export default function DashboardPage() {
           <motion.div variants={fadeUp}>
             <MetricCard
               label="Eye Contact"
-              value={87}
+              value={Math.round(metrics.eye_contact)}
               suffix="%"
-              trend="up"
-              trendValue="+12%"
+              trend={eyeTrend}
+              trendValue={eyeTrend === "up" ? "Strong" : "Needs focus"}
               icon={<Eye className="w-5 h-5" />}
               color="green"
             >
-              <ProgressBar value={87} color="#22C55E" />
+              <ProgressBar value={metrics.eye_contact} color="#22C55E" />
             </MetricCard>
           </motion.div>
 
@@ -205,25 +303,13 @@ export default function DashboardPage() {
           <motion.div variants={fadeUp}>
             <MetricCard
               label="Filler Words"
-              value={4}
-              trend="down"
-              trendValue="-2"
+              value={Math.round(metrics.filler_words)}
+              trend={fillerTrend}
+              trendValue={fillerTrend === "down" ? "Low" : "High"}
               icon={<MessageCircleWarning className="w-5 h-5" />}
               color="warning"
             >
-              <div className="flex items-center gap-3">
-                {["Um", "Uh", "Like", "So"].map((word, i) => (
-                  <motion.span
-                    key={word}
-                    initial={{ opacity: 0, scale: 0.8 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    transition={{ delay: 0.5 + i * 0.1 }}
-                    className="px-2 py-1 text-[10px] font-medium rounded-md bg-[#F59E0B]/10 text-[#F59E0B]/70 border border-[#F59E0B]/10"
-                  >
-                    {word}: {i === 0 ? 2 : i === 1 ? 1 : i === 2 ? 1 : 0}
-                  </motion.span>
-                ))}
-              </div>
+              <ProgressBar value={Math.min(metrics.filler_words * 10, 100)} color="#F59E0B" />
             </MetricCard>
           </motion.div>
 
@@ -231,15 +317,15 @@ export default function DashboardPage() {
           <motion.div variants={fadeUp}>
             <MetricCard
               label="Posture Score"
-              value={92}
+              value={Math.round(metrics.posture_score)}
               suffix="%"
-              trend="up"
-              trendValue="+5%"
+              trend={postureTrend}
+              trendValue={postureTrend === "up" ? "Aligned" : "Adjust"}
               icon={<PersonStanding className="w-5 h-5" />}
               color="violet"
             >
               <div className="flex justify-center">
-                <CircularProgress value={92} color="#8B5CF6" />
+                <CircularProgress value={metrics.posture_score} color="#8B5CF6" />
               </div>
             </MetricCard>
           </motion.div>
@@ -253,16 +339,16 @@ export default function DashboardPage() {
             <h3 className="text-sm font-semibold text-white/80">
               Session Overview
             </h3>
-            <span className="text-xs text-white/30 font-mono">
-              Session #47
+            <span className="text-xs text-white/30 font-mono capitalize">
+              {sessionStatus === "idle" ? "Standby" : `${sessionStatus} session`}
             </span>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
             {[
-              { label: "Duration", value: "3m 42s", sub: "Active" },
-              { label: "Clarity Score", value: "94%", sub: "+6% from last" },
-              { label: "Engagement", value: "A+", sub: "Excellent" },
-              { label: "Confidence", value: "88%", sub: "High" },
+              { label: "Head Stability", value: `${Math.round(metrics.head_stability)}%`, sub: metrics.head_stability >= 70 ? "Steady" : "Unstable" },
+              { label: "Engagement", value: `${Math.round(metrics.facial_engagement)}%`, sub: metrics.facial_engagement >= 70 ? "Expressive" : "Flat" },
+              { label: "Attention", value: `${Math.round(metrics.attention_intensity)}%`, sub: metrics.attention_intensity >= 70 ? "Focused" : "Distracted" },
+              { label: "Overall", value: `${Math.round((metrics.eye_contact + metrics.posture_score + metrics.head_stability + metrics.facial_engagement) / 4)}%`, sub: "Composite" },
             ].map((stat, i) => (
               <motion.div
                 key={stat.label}
@@ -279,6 +365,8 @@ export default function DashboardPage() {
         </GlassCard>
       </motion.div>
 
+      {/* Live Feedback Panel */}
+      <FeedbackPanel liveFeedback={feedback} onDismiss={dismissFeedback} />
     </motion.div>
   );
 }

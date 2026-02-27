@@ -1,0 +1,12 @@
+# Vision Agents SDK + Plugins
+vision-agents[getstream,gemini,deepgram,elevenlabs,ultralytics]
+# Web server + WebSocket
+fastapi[standard]
+uvicorn[standard]
+websockets
+# Env management
+python-dotenv
+# OpenCV for frame analysis
+opencv-python-headless
+numpy
+mediapipe

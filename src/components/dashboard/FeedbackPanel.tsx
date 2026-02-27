@@ -1,7 +1,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import {
   Lightbulb,
@@ -11,46 +11,36 @@ import {
   MessageCircle,
 } from "lucide-react";
 import GlassCard from "@/components/ui/GlassCard";
+import type { CoachingFeedback } from "@/hooks/useMetricsStream";
 
 interface FeedbackItem {
-  id: number;
+  id: number | string;
   severity: "info" | "warning" | "critical";
   headline: string;
   explanation: string;
   tip?: string;
 }
 
-const feedbackData: FeedbackItem[] = [
+const fallbackData: FeedbackItem[] = [
   {
     id: 1,
     severity: "info",
-    headline: "Great Eye Contact",
+    headline: "Ready to Analyze",
     explanation:
-      "You've maintained consistent eye contact for the past 30 seconds.",
-    tip: "Keep focusing on the center of the camera lens.",
-  },
-  {
-    id: 2,
-    severity: "warning",
-    headline: "Speaking Too Fast",
-    explanation: "Your pace increased to 185 WPM in the last segment.",
-    tip: "Take a brief pause between key points to let ideas land.",
-  },
-  {
-    id: 3,
-    severity: "critical",
-    headline: 'Filler Word Detected: "Um"',
-    explanation:
-      'You used "um" 3 times in the last 15 seconds.',
-    tip: "Try replacing filler words with a deliberate pause.",
-  },
-  {
-    id: 4,
-    severity: "info",
-    headline: "Posture Improved",
-    explanation: "Your shoulder alignment is now at 94% — up from 78%.",
+      "Start a session to receive real-time AI coaching feedback on your speaking.",
+    tip: "Click 'Start Session' to begin live analysis.",
   },
 ];
+
+function mapFeedbackToItem(fb: CoachingFeedback): FeedbackItem {
+  return {
+    id: fb.id,
+    severity: fb.severity,
+    headline: fb.headline,
+    explanation: fb.explanation,
+    tip: fb.tip,
+  };
+}
 
 const severityConfig = {
   info: {
@@ -76,19 +66,36 @@ const severityConfig = {
   },
 };
 
-export default function FeedbackPanel() {
+interface FeedbackPanelProps {
+  liveFeedback?: CoachingFeedback | null;
+  onDismiss?: () => void;
+}
+
+export default function FeedbackPanel({ liveFeedback, onDismiss }: FeedbackPanelProps) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [visible, setVisible] = useState(true);
 
+  // Use live feedback when available, otherwise cycle fallback
+  const feedbackData = liveFeedback ? [mapFeedbackToItem(liveFeedback)] : fallbackData;
+
   useEffect(() => {
+    if (liveFeedback) {
+      setVisible(true);
+      return;
+    }
     const interval = setInterval(() => {
-      setCurrentIndex((prev) => (prev + 1) % feedbackData.length);
+      setCurrentIndex((prev) => (prev + 1) % fallbackData.length);
       setVisible(true);
     }, 6000);
     return () => clearInterval(interval);
-  }, []);
+  }, [liveFeedback]);
 
-  const feedback = feedbackData[currentIndex];
+  const handleDismiss = useCallback(() => {
+    setVisible(false);
+    onDismiss?.();
+  }, [onDismiss]);
+
+  const feedback = feedbackData[currentIndex % feedbackData.length];
   const config = severityConfig[feedback.severity];
   const Icon = config.icon;
 
@@ -141,7 +148,7 @@ export default function FeedbackPanel() {
                       </h4>
                     </div>
                     <button
-                      onClick={() => setVisible(false)}
+                      onClick={handleDismiss}
                       className="flex-shrink-0 p-1 rounded-lg hover:bg-white/[0.06] transition-colors text-white/30 hover:text-white/60"
                     >
                       <X className="w-3.5 h-3.5" />
