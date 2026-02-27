@@ -49,9 +49,9 @@ from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import server_cfg, sdk_cfg
-from ai_service import AIService, ServiceRegistry
-from demo_service import DemoService
+from .config import server_cfg, sdk_cfg
+from .ai_service import AIService, ServiceRegistry
+from .demo_service import DemoService
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -36,10 +36,10 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from config import sdk_cfg, processing_cfg
-from models import SpeakingMetrics, CoachingFeedback, SessionTelemetry
-from speaking_coach_processor import SpeakingCoachProcessor, MetricsProducedEvent
-from reasoning_engine import ReasoningEngine
+from .config import sdk_cfg, processing_cfg
+from .models import SpeakingMetrics, CoachingFeedback, SessionTelemetry
+from .speaking_coach_processor import SpeakingCoachProcessor, MetricsProducedEvent
+from .reasoning_engine import ReasoningEngine
 
 logger = logging.getLogger("speakai.service")
 

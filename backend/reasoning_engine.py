@@ -17,8 +17,8 @@ import logging
 import time
 from typing import Any, Optional
 
-from models import SpeakingMetrics, CoachingFeedback
-from config import processing_cfg
+from .models import SpeakingMetrics, CoachingFeedback
+from .config import processing_cfg
 
 logger = logging.getLogger("speakai.reasoning")
 

@@ -37,8 +37,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from models import SpeakingMetrics
-from config import processing_cfg
+from .models import SpeakingMetrics
+from .config import processing_cfg
 
 # -- Optional heavy imports --------------------------------------------------
 
