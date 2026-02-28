@@ -18,6 +18,11 @@ os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 load_dotenv()
 
+# ── Bridge env-var naming: Gemini SDK reads GOOGLE_API_KEY ──────────────
+_gemini_key = os.getenv("GEMINI_API_KEY", "")
+if _gemini_key and not os.getenv("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = _gemini_key
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -68,11 +73,11 @@ class SDKConfig:
 @dataclass(frozen=True)
 class ProcessingConfig:
     # Coaching reasoning cooldown (seconds between LLM reasoning calls)
-    reasoning_cooldown: float = 0.8
+    reasoning_cooldown: float = 0.6  # ⚡ Was 0.8 — faster coaching cadence
     # Hard timeout for a single LLM reasoning call
-    reasoning_timeout: float = 1.5
+    reasoning_timeout: float = 1.2  # ⚡ Was 1.5 — fail fast, fallback fast
     # Threshold-feedback cooldown
-    feedback_cooldown: float = 1.0
+    feedback_cooldown: float = 0.8  # ⚡ Was 1.0
     # Status broadcast interval
     status_broadcast_interval: float = 1.0
     # Frame processing FPS for the SpeakingCoachProcessor
@@ -86,19 +91,25 @@ class ProcessingConfig:
 @dataclass(frozen=True)
 class ConversationConfig:
     # Max conversation history entries to keep in context
-    max_context_messages: int = 30
+    max_context_messages: int = 20  # ⚡ Was 30 — smaller context = faster prompt
     # Silence threshold (seconds) before agent proactively speaks
     silence_prompt_timeout: float = 6.0
     # Min silence (seconds) before agent responds (avoids interruptions)
-    response_delay: float = 0.15
+    response_delay: float = 0.05  # ⚡ Was 0.15 — near-instant response start
+    # Voice debounce (seconds) — how long to wait for speech to stabilize
+    voice_debounce_seconds: float = 0.15  # ⚡ Fast turn detection
     # Max tokens for conversation context sent to LLM
-    max_context_tokens: int = 1024
+    max_context_tokens: int = 800  # ⚡ Was 1024 — shorter prompt = faster inference
     # Audio chunk size for speech processing (ms)
     audio_chunk_ms: int = 60
     # VAD (Voice Activity Detection) sensitivity 0.0–1.0
     vad_sensitivity: float = 0.6
     # Enable proactive agent (agent speaks without being asked)
     proactive_mode: bool = True
+    # Hard timeout for a single LLM conversation call (seconds)
+    llm_timeout: float = 5.0  # Realtime LLM can take longer than non-streaming
+    # Context window: how many recent messages to include in LLM prompt
+    context_window: int = 4  # ⚡ Fewer messages = faster prompt
     # System prompt for conversation mode
     system_prompt: str = (
         "You are SpeakAI, a real-time communication coach in a live video call. "
@@ -111,6 +122,33 @@ class ConversationConfig:
 
 
 # ---------------------------------------------------------------------------
+# Performance / Latency Optimization
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PerformanceConfig:
+    """Latency optimization settings."""
+    # Pre-warm LLM connection on agent join (eliminates cold-start)
+    pre_warm_llm: bool = True
+    # Pre-warm TTS connection on agent join
+    pre_warm_tts: bool = True
+    # ElevenLabs streaming latency optimization level (0-4, 4=max)
+    tts_optimize_streaming_latency: int = 4
+    # Use ElevenLabs turbo model
+    tts_model: str = "eleven_turbo_v2_5"
+    # ElevenLabs output format — raw PCM avoids decode overhead
+    tts_output_format: str = "pcm_16000"
+    # Gemini model — flash-lite is fastest available
+    llm_model: str = "gemini-2.0-flash-live-001"
+    # Gemini temperature — lower = faster, more deterministic
+    llm_temperature: float = 0.3
+    # Target latencies (for dashboard display)
+    join_target_ms: int = 500
+    transport_target_ms: int = 30
+    e2e_response_target_ms: int = 1500
+
+
+# ---------------------------------------------------------------------------
 # Singletons
 # ---------------------------------------------------------------------------
 
@@ -118,3 +156,4 @@ server_cfg = ServerConfig()
 sdk_cfg = SDKConfig()
 processing_cfg = ProcessingConfig()
 conversation_cfg = ConversationConfig()
+performance_cfg = PerformanceConfig()

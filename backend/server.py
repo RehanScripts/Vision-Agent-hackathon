@@ -52,8 +52,9 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .core.config import server_cfg, sdk_cfg
 from .services.ai_service import AIService
@@ -192,6 +193,122 @@ async def session_detail(session_id: str):
             "telemetry": demo.telemetry.to_dict(),
         }
     return {"error": "session not found"}
+
+
+# ---------------------------------------------------------------------------
+# Video Upload Analysis
+# ---------------------------------------------------------------------------
+
+@app.post("/analyze-video")
+async def analyze_video(file: UploadFile = File(...)):
+    """
+    Accept a video upload, run MediaPipe frame-by-frame analysis,
+    and return aggregated speaking metrics + timeline.
+    """
+    import tempfile, os
+
+    content_type = file.content_type or ""
+    if not content_type.startswith("video/"):
+        return JSONResponse(status_code=400, content={"error": f"Expected video, got {content_type}"})
+
+    try:
+        suffix = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            tmp.write(await file.read())
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Upload failed: {str(e)[:200]}"})
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, _process_video_file, tmp_path)
+        return result
+    except Exception as e:
+        logger.error(f"Video analysis error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": f"Analysis failed: {str(e)[:200]}"})
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _process_video_file(video_path: str) -> Dict[str, Any]:
+    """Process video frames with PyAV (Vision Agents SDK) + MediaPipe."""
+    import av as _av
+
+    from .processing.processor import SpeakingCoachProcessor
+
+    try:
+        container = _av.open(video_path)
+    except Exception as e:
+        return {"error": f"Could not open video: {str(e)[:200]}"}
+
+    video_stream = container.streams.video[0]
+    total_frames = video_stream.frames or 0
+    fps = float(video_stream.average_rate or video_stream.guessed_rate or 30)
+    duration_s = float(video_stream.duration * video_stream.time_base) if video_stream.duration else (total_frames / fps if fps > 0 else 0)
+    width = video_stream.codec_context.width
+    height = video_stream.codec_context.height
+    sample_interval = max(1, int(fps / 3))  # ~3 FPS analysis
+
+    processor = SpeakingCoachProcessor(fps=3, max_workers=1)
+    all_metrics: list = []
+    frame_idx = 0
+
+    for frame in container.decode(video=0):
+        if frame_idx % sample_interval == 0:
+            frame_rgb = frame.to_ndarray(format="rgb24")
+            all_metrics.append(processor._analyze_sync(frame_rgb))
+        frame_idx += 1
+
+    container.close()
+    if processor._face_mesh:
+        processor._face_mesh.close()
+    if processor._pose:
+        processor._pose.close()
+    processor._executor.shutdown(wait=False)
+
+    if total_frames == 0:
+        total_frames = frame_idx
+
+    if not all_metrics:
+        return {"error": "No frames could be processed from the video"}
+
+    def avg(f: str) -> float:
+        return round(sum(getattr(m, f) for m in all_metrics) / len(all_metrics), 1)
+
+    timeline = []
+    for i, m in enumerate(all_metrics):
+        timeline.append({
+            "time_s": round(i * (sample_interval / fps), 1),
+            "eye_contact": round(m.eye_contact, 1),
+            "head_stability": round(m.head_stability, 1),
+            "posture_score": round(m.posture_score, 1),
+            "facial_engagement": round(m.facial_engagement, 1),
+            "attention_intensity": round(m.attention_intensity, 1),
+        })
+
+    overall = round((avg("eye_contact") + avg("head_stability") + avg("posture_score") + avg("facial_engagement")) / 4, 1)
+
+    return {
+        "status": "ok",
+        "video_info": {
+            "duration_s": round(duration_s, 1),
+            "total_frames": total_frames,
+            "fps": round(fps, 1),
+            "resolution": f"{width}x{height}",
+            "frames_analyzed": len(all_metrics),
+        },
+        "metrics": {
+            "eye_contact": avg("eye_contact"),
+            "head_stability": avg("head_stability"),
+            "posture_score": avg("posture_score"),
+            "facial_engagement": avg("facial_engagement"),
+            "attention_intensity": avg("attention_intensity"),
+            "overall_score": overall,
+        },
+        "timeline": timeline,
+    }
 
 
 # ---------------------------------------------------------------------------

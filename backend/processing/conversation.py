@@ -163,8 +163,8 @@ class ConversationManager:
 
     async def _send_welcome(self) -> None:
         """Send an initial greeting when the agent joins."""
-        logger.info(f"[{self.session_id}] 🎤 Welcome task started, waiting 3s...")
-        await asyncio.sleep(3.0)  # Let everything initialize
+        logger.info(f"[{self.session_id}] 🎤 Welcome task started, waiting 1.5s...")
+        await asyncio.sleep(1.5)  # ⚡ Was 3.0 — faster welcome
         if not self._active:
             logger.warning(f"[{self.session_id}] Welcome aborted — session no longer active")
             return
@@ -188,11 +188,12 @@ class ConversationManager:
             if asyncio.iscoroutine(cb):
                 await cb
 
-        # Also speak the welcome via TTS
+        # Also speak the welcome via TTS (non-blocking — don't wait for TTS)
         if self._on_agent_speech:
-            cb = self._on_agent_speech(welcome)
-            if asyncio.iscoroutine(cb):
-                await cb
+            asyncio.create_task(
+                self._call_agent_speech(welcome),
+                name=f"welcome-tts-{self.session_id}",
+            )
 
         logger.info(f"[{self.session_id}] Welcome message sent")
 
@@ -297,9 +298,17 @@ class ConversationManager:
             await self._generate_response(trigger="voice_input")
 
     async def _flush_voice_utterance(self) -> None:
-        """Debounce fragmented voice transcript chunks into a single utterance."""
+        """Debounce fragmented voice transcript chunks into a single utterance.
+
+        NOTE: In Realtime mode, Gemini already responds to voice input
+        automatically — we only record the transcript for the UI and
+        state tracking.  No manual response is generated to avoid
+        double-speaking.
+        """
         try:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(
+                getattr(conversation_cfg, 'voice_debounce_seconds', 0.15)
+            )  # ⚡ Configurable, default 0.15s
         except asyncio.CancelledError:
             return
 
@@ -328,15 +337,10 @@ class ConversationManager:
                 await cb
 
         self._last_user_speech_end = time.time()
-        self._pending_response = True
 
-        if self._pending_response_task and not self._pending_response_task.done():
-            self._pending_response_task.cancel()
-
-        self._pending_response_task = asyncio.create_task(
-            self._delayed_response(),
-            name=f"delay-response-{self.session_id}",
-        )
+        # In Realtime mode, Gemini handles voice responses natively.
+        # We skip manual response generation to avoid duplicate audio.
+        # Proactive worker still fires if there's prolonged silence.
 
     @staticmethod
     def _normalize_voice_text(text: str) -> str:
@@ -354,6 +358,11 @@ class ConversationManager:
 
         FRESHNESS GATE: Visual-dependent responses are blocked unless
         metrics are fresh and from a real visual source.
+
+        REALTIME NOTE: When using Gemini Realtime, agent.llm.simple_response()
+        already generates audio output natively.  We only call
+        _call_agent_speech() for deterministic fallback responses that
+        did NOT go through the LLM (to avoid double-speaking).
         """
         now = time.time()
 
@@ -365,8 +374,11 @@ class ConversationManager:
         await self._broadcast_state()
 
         try:
+            llm_already_spoke = False
             response_text = await self._call_llm(trigger)
-            if not response_text or not response_text.strip():
+            if response_text and response_text.strip():
+                llm_already_spoke = True  # Realtime LLM already generated audio
+            else:
                 response_text = self._fallback_response(trigger)
 
             clean_response = response_text.strip() if response_text else ""
@@ -401,11 +413,13 @@ class ConversationManager:
                     if asyncio.iscoroutine(cb):
                         await cb
 
-                # Tell agent to speak (TTS)
-                if self._on_agent_speech:
-                    cb = self._on_agent_speech(clean_response)
-                    if asyncio.iscoroutine(cb):
-                        await cb
+                # Speak via agent — only for fallback/deterministic responses.
+                # When the LLM was used, Gemini Realtime already generated audio.
+                if not llm_already_spoke and self._on_agent_speech:
+                    asyncio.create_task(
+                        self._call_agent_speech(clean_response),
+                        name=f"speak-{self.session_id}",
+                    )
 
         except Exception as e:
             logger.warning(f"[{self.session_id}] Response generation failed: {e}")
@@ -446,7 +460,7 @@ class ConversationManager:
                 prompt = self._build_llm_prompt(trigger, latest_user_text, has_live_visual)
                 response = await asyncio.wait_for(
                     self._agent.llm.simple_response(prompt),
-                    timeout=conversation_cfg.llm_timeout if hasattr(conversation_cfg, 'llm_timeout') else 5.0,
+                    timeout=getattr(conversation_cfg, 'llm_timeout', 1.5),  # ⚡ Configurable
                 )
                 text = getattr(response, "text", str(response)).strip()
                 if text and len(text) > 5:
@@ -687,6 +701,16 @@ class ConversationManager:
                 logger.debug(f"[{self.session_id}] Proactive worker error: {e}")
 
     # ── State broadcasting ──────────────────────────────────────────────
+
+    async def _call_agent_speech(self, text: str) -> None:
+        """Fire-and-forget wrapper for agent speech callback (TTS)."""
+        try:
+            if self._on_agent_speech:
+                cb = self._on_agent_speech(text)
+                if asyncio.iscoroutine(cb):
+                    await cb
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] Agent speech error: {e}")
 
     async def _broadcast_state(self) -> None:
         """Push conversation state to frontend."""

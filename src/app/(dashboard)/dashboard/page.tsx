@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import StreamCallPanel from "@/components/dashboard/StreamCallPanel";
-import ChatPanel from "@/components/dashboard/ChatPanel";
+import VideoUploadPanel from "@/components/dashboard/VideoUploadPanel";
 import MetricCard from "@/components/ui/MetricCard";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
@@ -433,16 +433,13 @@ function DashboardPage() {
             onReadyChange={setStreamReady}
             onMediaReadyChange={setStreamMediaReady}
             onCallIdChange={setStreamCallId}
+            pipelineStatus={systemStatus?.pipeline}
+            healthStatus={systemStatus?.health}
+            sessionMode={systemStatus?.session_mode}
           />
-          {/* AI Communication Panel */}
+          {/* Video Upload & Analysis Panel */}
           <motion.div variants={fadeUp} className="mt-4">
-            <ChatPanel
-              messages={chatMessages}
-              transcript={transcript}
-              conversationState={conversationState}
-              onSendMessage={sendMessage}
-              sessionActive={isSessionActive}
-            />
+            <VideoUploadPanel />
           </motion.div>
         </motion.div>
 

@@ -21,16 +21,34 @@ import {
   Users,
   Loader2,
   AlertTriangle,
+  Camera,
+  Mic,
+  Activity,
 } from "lucide-react";
 
 interface StreamCallPanelProps {
   className?: string;
-  connectionStatus?: "connected" | "connecting" | "disconnected";
-  sessionStatus?: "idle" | "active" | "completed";
+  connectionStatus?: "connected" | "connecting" | "disconnected" | "error" | "reconnecting";
+  sessionStatus?: "idle" | "active" | "completed" | "starting" | "demo";
   streaming?: boolean;
   onReadyChange?: (ready: boolean) => void;
   onMediaReadyChange?: (ready: boolean) => void;
   onCallIdChange?: (callId: string) => void;
+  /** Pipeline diagnostics from backend system_status */
+  pipelineStatus?: {
+    frames_processed?: number;
+    direct_reader_active?: boolean;
+    forwarder_active?: boolean;
+    last_latency_ms?: number;
+  };
+  /** Health check snapshot */
+  healthStatus?: {
+    video?: boolean;
+    audio?: boolean;
+    model?: boolean;
+  };
+  /** Session mode from backend */
+  sessionMode?: string;
 }
 
 type CallStatus = "idle" | "joining" | "joined" | "error";
@@ -43,6 +61,9 @@ export default function StreamCallPanel({
   onReadyChange,
   onMediaReadyChange,
   onCallIdChange,
+  pipelineStatus,
+  healthStatus,
+  sessionMode,
 }: StreamCallPanelProps) {
   void _streaming;
   const [status, setStatus] = useState<CallStatus>("idle");
@@ -52,9 +73,11 @@ export default function StreamCallPanel({
   const [call, setCall] = useState<ReturnType<StreamVideoClient["call"]> | null>(null);
   const [userId, setUserId] = useState("user-loading");
   const [showControls, setShowControls] = useState(false);
+  const [joinLatencyMs, setJoinLatencyMs] = useState<number | null>(null);
   const clientRef = useRef<StreamVideoClient | null>(null);
   const callRef = useRef<ReturnType<StreamVideoClient["call"]> | null>(null);
   const controlsTimeout = useRef<NodeJS.Timeout | null>(null);
+  const joinStartRef = useRef<number>(0);
 
   useEffect(() => {
     if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -92,6 +115,7 @@ export default function StreamCallPanel({
     setClient(null);
     setStatus("idle");
     setError(null);
+    setJoinLatencyMs(null);
     onReadyChange?.(false);
     onMediaReadyChange?.(false);
   }, [onMediaReadyChange, onReadyChange]);
@@ -107,6 +131,7 @@ export default function StreamCallPanel({
 
     setStatus("joining");
     setError(null);
+    joinStartRef.current = performance.now(); // ⚡ Start latency timer
 
     if (callRef.current || clientRef.current) {
       await leaveCall();
@@ -142,14 +167,21 @@ export default function StreamCallPanel({
       const videoCall = videoClient.call("default", callId);
       await videoCall.join({ create: true });
 
-      try {
-        await videoCall.camera.enable();
-        await videoCall.microphone.enable();
-        onMediaReadyChange?.(true);
-      } catch {
-        onMediaReadyChange?.(false);
-        setError("Camera/Mic failed. Allow permissions and retry.");
-      }
+      // ⚡ Measure join latency
+      const elapsed = Math.round(performance.now() - joinStartRef.current);
+      setJoinLatencyMs(elapsed);
+      console.log(`📞 Joined call in ${elapsed}ms`);
+
+      // Enable camera + mic in parallel (non-blocking)
+      Promise.all([
+        videoCall.camera.enable().catch(() => null),
+        videoCall.microphone.enable().catch(() => null),
+      ]).then(([cam, mic]) => {
+        onMediaReadyChange?.(cam !== null || mic !== null);
+        if (cam === null && mic === null) {
+          setError("Camera/Mic failed. Allow permissions and retry.");
+        }
+      });
 
       clientRef.current = videoClient;
       callRef.current = videoCall;
@@ -162,6 +194,7 @@ export default function StreamCallPanel({
       const message = err instanceof Error ? err.message : "Failed to join call";
       setStatus("error");
       setError(message);
+      setJoinLatencyMs(null);
       onReadyChange?.(false);
       onMediaReadyChange?.(false);
     }
@@ -249,6 +282,57 @@ export default function StreamCallPanel({
             <div className="flex items-center gap-1 px-2 py-1 rounded-full text-[10px] backdrop-blur-md border bg-[#8B5CF6]/15 border-[#8B5CF6]/20 text-[#8B5CF6]/80">
               <Users className="w-3 h-3" />
               In Call
+            </div>
+          )}
+          {/* Join latency badge */}
+          {joinLatencyMs !== null && (
+            <div
+              className={cn(
+                "flex items-center gap-1 px-2 py-1 rounded-full text-[10px] backdrop-blur-md border",
+                joinLatencyMs < 1000
+                  ? "bg-[#22C55E]/15 border-[#22C55E]/20 text-[#22C55E]/80"
+                  : joinLatencyMs < 2500
+                    ? "bg-[#F59E0B]/15 border-[#F59E0B]/20 text-[#F59E0B]/80"
+                    : "bg-[#EF4444]/15 border-[#EF4444]/20 text-[#EF4444]/80"
+              )}
+            >
+              <Activity className="w-3 h-3" />
+              {joinLatencyMs}ms join
+            </div>
+          )}
+          {/* Pipeline health indicators */}
+          {status === "joined" && healthStatus && (
+            <>
+              <div
+                className={cn(
+                  "flex items-center gap-1 px-2 py-1 rounded-full text-[10px] backdrop-blur-md border",
+                  healthStatus.video
+                    ? "bg-[#22C55E]/15 border-[#22C55E]/20 text-[#22C55E]/80"
+                    : "bg-[#F59E0B]/15 border-[#F59E0B]/20 text-[#F59E0B]/80"
+                )}
+              >
+                <Camera className="w-3 h-3" />
+                {healthStatus.video ? "Video" : "No Video"}
+              </div>
+              <div
+                className={cn(
+                  "flex items-center gap-1 px-2 py-1 rounded-full text-[10px] backdrop-blur-md border",
+                  healthStatus.audio
+                    ? "bg-[#22C55E]/15 border-[#22C55E]/20 text-[#22C55E]/80"
+                    : "bg-[#EF4444]/15 border-[#EF4444]/20 text-[#EF4444]/80"
+                )}
+              >
+                <Mic className="w-3 h-3" />
+                {healthStatus.audio ? "Audio" : "No Audio"}
+              </div>
+            </>
+          )}
+          {/* Frame processing indicator */}
+          {status === "joined" && pipelineStatus && (pipelineStatus.frames_processed ?? 0) > 0 && (
+            <div className="flex items-center gap-1 px-2 py-1 rounded-full text-[10px] backdrop-blur-md border bg-[#22C55E]/10 border-[#22C55E]/20 text-[#22C55E]/70">
+              <Activity className="w-3 h-3" />
+              {pipelineStatus.frames_processed} frames
+              {pipelineStatus.direct_reader_active && " (direct)"}
             </div>
           )}
         </div>

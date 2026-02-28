@@ -98,6 +98,17 @@ export interface SystemStatus {
   health?: { video: boolean; audio: boolean; model: boolean };
   /** Latency trace */
   latency?: Record<string, unknown>;
+  /** Pipeline diagnostics (video frame extraction health) */
+  pipeline?: PipelineDiagnostics;
+}
+
+/** Video pipeline diagnostics from the processor */
+export interface PipelineDiagnostics {
+  frames_processed: number;
+  last_latency_ms: number;
+  direct_reader_active: boolean;
+  forwarder_active: boolean;
+  has_raw_track: boolean;
 }
 
 /** Session state values from the backend state machine */
@@ -308,6 +319,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
               session_state: transitionData.session_state as SessionStateValue,
               session_mode: transitionData.session_mode as SessionModeValue,
               health: transitionData.health as { video: boolean; audio: boolean; model: boolean },
+              pipeline: transitionData.pipeline as PipelineDiagnostics | undefined,
             }));
             break;
           }

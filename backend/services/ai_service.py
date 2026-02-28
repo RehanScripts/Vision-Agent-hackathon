@@ -36,7 +36,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional
 
-from ..core.config import sdk_cfg, processing_cfg, conversation_cfg
+from ..core.config import sdk_cfg, processing_cfg, conversation_cfg, performance_cfg
 from ..core.models import (
     SpeakingMetrics,
     CoachingFeedback,
@@ -160,6 +160,10 @@ class AIService:
         self._pending_chat: deque[str] = deque(maxlen=50)
         self._starting = False
         self._latest_emitted_metrics: Optional[SpeakingMetrics] = None
+
+        # Pre-warm state
+        self._llm_warmed = False
+        self._tts_warmed = False
 
     @property
     def is_active(self) -> bool:
@@ -303,8 +307,15 @@ class AIService:
                         id=f"speakai-{self.session_id[:8]}",
                     ),
                     instructions=conversation_cfg.system_prompt,
-                    llm=gemini.Realtime(fps=sdk_cfg.llm_fps),
-                    tts=elevenlabs.TTS(model_id="eleven_turbo_v2_5"),
+                    llm=gemini.Realtime(
+                        fps=sdk_cfg.llm_fps,
+                        api_key=sdk_cfg.gemini_api_key or None,
+                        config={"temperature": performance_cfg.llm_temperature},
+                    ),
+                    tts=elevenlabs.TTS(
+                        model_id=performance_cfg.tts_model,
+                        api_key=sdk_cfg.elevenlabs_api_key or None,
+                    ),
                     processors=[self._processor],
                 )
                 return agent
@@ -351,8 +362,27 @@ class AIService:
                         except Exception as e:
                             logger.warning(f"[{self.session_id}] Agent event subscription failed: {e}")
 
+                        # ── TRACK INTROSPECTION: discover existing tracks ──
+                        # If tracks were added before our event subscription, we
+                        # won't get TrackAddedEvent for them. Introspect the agent
+                        # to find any already-connected tracks.
+                        await self._introspect_tracks(agent)
+
                         # Start conversation manager
                         await self._conversation.start()
+
+                        # ── PRE-WARM: LLM + TTS connections ──────
+                        # Eliminates cold-start latency on first response
+                        if performance_cfg.pre_warm_llm:
+                            asyncio.create_task(
+                                self._pre_warm_llm(agent),
+                                name=f"prewarm-llm-{self.session_id}",
+                            )
+                        if performance_cfg.pre_warm_tts:
+                            asyncio.create_task(
+                                self._pre_warm_tts(agent),
+                                name=f"prewarm-tts-{self.session_id}",
+                            )
 
                         self._join_ready.set()
 
@@ -523,18 +553,65 @@ class AIService:
             elif _TrackAddedEvent and isinstance(event, _TrackAddedEvent):
                 track_type = getattr(event, "track_type", "unknown")
                 track_id = getattr(event, "track_id", "unknown")
+                track = getattr(event, "track", None)
+                participant_id = getattr(event, "participant_id", None)
                 logger.info(
-                    f"[{self.session_id}] Track added: type={track_type}, id={track_id}"
+                    f"[{self.session_id}] Track added: type={track_type}, "
+                    f"id={track_id}, participant={participant_id}, "
+                    f"track_obj={type(track).__name__ if track else 'None'}"
                 )
                 # Report to policy layer
                 if str(track_type).lower() in ("video", "screenshare"):
                     self._policy.report_frame()  # First track arrival = first frame signal
+
+                    # ── CRITICAL: Explicitly trigger processor.process_video() ──
+                    # The SDK's automatic processor pipeline via agents.processors=[]
+                    # may not always call process_video(). This ensures the processor
+                    # gets the track directly when we detect it via events.
+                    if track is not None and self._processor is not None:
+                        try:
+                            logger.info(
+                                f"[{self.session_id}] 🎥 Explicitly forwarding video "
+                                f"track to processor"
+                            )
+                            await self._processor.process_video(
+                                track=track,
+                                participant_id=str(participant_id) if participant_id else None,
+                                shared_forwarder=None,  # Let processor create its own
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[{self.session_id}] Failed to forward track to processor: {e}",
+                                exc_info=True,
+                            )
+
                 if str(track_type).lower() == "audio":
                     self._policy.report_audio_state(True)
+                    # Forward audio track to audio processor
+                    if track is not None and self._audio_processor is not None:
+                        try:
+                            await self._audio_processor.process_audio(
+                                track=track,
+                                participant_id=str(participant_id) if participant_id else None,
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"[{self.session_id}] Audio track forward: {e}"
+                            )
 
             elif _TrackRemovedEvent and isinstance(event, _TrackRemovedEvent):
                 track_id = getattr(event, "track_id", "unknown")
-                logger.info(f"[{self.session_id}] Track removed: id={track_id}")
+                track_type = getattr(event, "track_type", "unknown")
+                logger.info(
+                    f"[{self.session_id}] Track removed: type={track_type}, id={track_id}"
+                )
+                # If video track removed, stop processor
+                if str(track_type).lower() in ("video", "screenshare"):
+                    if self._processor is not None:
+                        try:
+                            await self._processor.stop_processing()
+                        except Exception:
+                            pass
 
             else:
                 # Log ALL other events for debugging
@@ -550,6 +627,141 @@ class AIService:
 
         except Exception as e:
             logger.debug(f"[{self.session_id}] SDK event handler error: {e}")
+
+    async def _introspect_tracks(self, agent: Any) -> None:
+        """
+        Discover any video/audio tracks the agent already has access to.
+        This covers the race condition where tracks are added before our
+        event subscription starts.
+        """
+        try:
+            # Check various SDK attribute patterns for track access
+            tracks_found = 0
+
+            # Pattern 1: agent.call.participants / remote tracks
+            call = getattr(agent, 'call', None) or getattr(agent, '_call', None)
+            if call:
+                participants = (
+                    getattr(call, 'participants', None) or
+                    getattr(call, 'members', None) or
+                    []
+                )
+                for p in participants if hasattr(participants, '__iter__') else []:
+                    pid = getattr(p, 'id', getattr(p, 'user_id', 'unknown'))
+                    # Skip the agent's own tracks
+                    agent_id = getattr(agent, 'id', '')
+                    if pid == agent_id:
+                        continue
+
+                    for track_attr in ('video_track', 'video', 'published_tracks'):
+                        track = getattr(p, track_attr, None)
+                        if track is not None:
+                            logger.info(
+                                f"[{self.session_id}] Introspected video track "
+                                f"from participant {pid}"
+                            )
+                            if self._processor:
+                                await self._processor.process_video(
+                                    track=track,
+                                    participant_id=str(pid),
+                                )
+                            tracks_found += 1
+                            break
+
+            # Pattern 2: agent._video_forwarder (some SDK versions expose this)
+            forwarder = getattr(agent, '_video_forwarder', None)
+            if forwarder and self._processor and tracks_found == 0:
+                logger.info(
+                    f"[{self.session_id}] Found agent's video forwarder — "
+                    f"attaching processor"
+                )
+                # The processor's process_video was already called by the SDK
+                # via processors=[] — but let's verify it's working
+                if self._processor.frames_processed == 0:
+                    logger.info(
+                        f"[{self.session_id}] Processor has 0 frames — "
+                        f"watchdog will handle fallback"
+                    )
+
+            # Pattern 3: agent._edge or edge transport object
+            edge = getattr(agent, 'edge', getattr(agent, '_edge', None))
+            if edge:
+                remote_tracks = getattr(edge, 'remote_tracks', None)
+                if remote_tracks and hasattr(remote_tracks, '__iter__'):
+                    for rt in remote_tracks:
+                        kind = getattr(rt, 'kind', '')
+                        if 'video' in str(kind).lower() and self._processor:
+                            logger.info(
+                                f"[{self.session_id}] Introspected remote video track "
+                                f"from edge transport"
+                            )
+                            await self._processor.process_video(
+                                track=rt,
+                                participant_id=None,
+                            )
+                            tracks_found += 1
+
+            logger.info(
+                f"[{self.session_id}] Track introspection complete: "
+                f"found {tracks_found} tracks"
+            )
+
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] Track introspection: {e}")
+
+    # ── Pre-warm: eliminate cold-start latency ──────────────────────────
+
+    async def _pre_warm_llm(self, agent: Any) -> None:
+        """
+        Pre-warm the LLM connection by sending a trivial prompt.
+        Eliminates ~500-1500ms cold-start on the first real user interaction.
+        """
+        try:
+            if not agent or not hasattr(agent, "llm"):
+                return
+
+            t0 = time.perf_counter()
+            response = await asyncio.wait_for(
+                agent.llm.simple_response("Respond with OK"),
+                timeout=3.0,
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self._llm_warmed = True
+            logger.info(
+                f"[{self.session_id}] ⚡ LLM pre-warmed in {elapsed_ms:.0f}ms"
+            )
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.session_id}] LLM pre-warm timed out")
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] LLM pre-warm skipped: {e}")
+
+    async def _pre_warm_tts(self, agent: Any) -> None:
+        """
+        Pre-warm the speech pipeline.
+
+        In Realtime mode TTS=None so agent.say() is a no-op.
+        We warm up via simple_response which goes through the
+        Realtime LLM's native audio generation path.
+        """
+        try:
+            if not agent:
+                return
+
+            t0 = time.perf_counter()
+            # In Realtime mode, simple_response warms the audio output path
+            await asyncio.wait_for(
+                agent.simple_response("Respond with a single word: ready"),
+                timeout=5.0,
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self._tts_warmed = True
+            logger.info(
+                f"[{self.session_id}] ⚡ Speech pipeline pre-warmed in {elapsed_ms:.0f}ms"
+            )
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.session_id}] Speech pre-warm timed out")
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] Speech pre-warm skipped: {e}")
 
     # ── Communication event handlers ────────────────────────────────────
 
@@ -594,21 +806,25 @@ class AIService:
     async def _handle_agent_speech(self, text: str) -> None:
         """
         Called when the ConversationManager wants the agent to speak.
-        Uses agent.say() which sends AgentSayEvent → TTS pipeline → audio in call.
+
+        In Realtime mode (Gemini handles STT+TTS), agent.say() is a no-op
+        because TTS is None.  Use agent.simple_response() which sends the
+        text to the Realtime LLM, and the model generates audio natively.
         """
         if not self._agent:
             logger.warning(f"[{self.session_id}] Cannot speak — agent not ready")
             return
 
         try:
-            await self._agent.say(text)
+            # Prefer simple_response (works in Realtime mode where TTS=None)
+            await self._agent.simple_response(text)
 
             # ── LATENCY: mark first response ──
             self._latency.mark_first_response()
 
             logger.info(f"[{self.session_id}] Agent spoke: {text[:80]}...")
         except Exception as e:
-            logger.error(f"[{self.session_id}] Agent say failed: {e}", exc_info=True)
+            logger.error(f"[{self.session_id}] Agent speech failed: {e}", exc_info=True)
 
     # ── Stop: tear down agent + workers ─────────────────────────────────
 
@@ -632,6 +848,13 @@ class AIService:
         # Stop audio processor
         if self._audio_processor:
             await self._audio_processor.close()
+
+        # Stop video processor (cleans up direct reader + watchdog)
+        if self._processor:
+            try:
+                await self._processor.close()
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Processor close: {e}")
 
         # Cancel background tasks (including health monitor)
         for task in [self._reasoning_task, self._status_task,
@@ -686,9 +909,11 @@ class AIService:
           with visual fields explicitly zeroed and source="audio_only".
         - NO silent fallback generation. If no data exists, nothing is sent.
         - The policy layer gates all emission decisions.
+        - Reports frame arrivals to the health system for mode transitions.
         """
         fps = processing_cfg.processor_fps
         interval = 1.0 / fps if fps > 0 else 0.2
+        _last_frame_count = 0
 
         while self._active:
             try:
@@ -697,16 +922,30 @@ class AIService:
                     break
 
                 has_video_frames = self._processor.frames_processed > 0
+                current_frame_count = self._processor.frames_processed
+
+                # Report new frames to health system (drives mode transitions)
+                if current_frame_count > _last_frame_count:
+                    self._policy.report_frame(self._processor.latest.timestamp)
+                    self._latency.mark_first_frame()
+
+                    # On first frame, log the pipeline source
+                    if _last_frame_count == 0:
+                        source = (
+                            "direct_reader"
+                            if self._processor._direct_reader_active
+                            else "forwarder"
+                        )
+                        logger.info(
+                            f"[{self.session_id}] 🎬 First video frame via {source} — "
+                            f"activating multimodal pipeline"
+                        )
+
+                    _last_frame_count = current_frame_count
 
                 if has_video_frames:
                     # Real MediaPipe metrics from processed video frames
                     metrics = self._processor.latest
-
-                    # ── POLICY: report frame to health system ──
-                    self._policy.report_frame(metrics.timestamp)
-
-                    # ── LATENCY: mark first frame ──
-                    self._latency.mark_first_frame()
                 else:
                     # ── NO SILENT FALLBACK ──
                     # In audio-only mode, emit audio-derived metrics only.
@@ -845,6 +1084,17 @@ class AIService:
                 # ── POLICY: diagnostics from the policy layer ──
                 policy_diag = self._policy.diagnostics()
 
+                # ── PROCESSOR: pipeline health diagnostics ──
+                processor_diag = {}
+                if self._processor:
+                    processor_diag = {
+                        "frames_processed": self._processor.frames_processed,
+                        "last_latency_ms": self._processor.last_latency_ms,
+                        "direct_reader_active": self._processor._direct_reader_active,
+                        "forwarder_active": self._processor._video_forwarder is not None,
+                        "has_raw_track": self._processor._raw_track is not None,
+                    }
+
                 status = {
                     "session_id": self.session_id,
                     "call_id": self.telemetry.call_id,
@@ -865,9 +1115,17 @@ class AIService:
                     "conversation_turns": self.telemetry.conversation_turns,
                     "conversation": conversation_state,
                     "audio": audio_stats,
-                    # ── Health + latency diagnostics ──
+                    # ── Health + latency + pipeline diagnostics ──
                     "health": policy_diag.get("health", {}),
                     "latency": self._latency.summary(),
+                    "pipeline": processor_diag,
+                    "performance": {
+                        "llm_warmed": self._llm_warmed,
+                        "tts_warmed": self._tts_warmed,
+                        "reasoning_cooldown_s": processing_cfg.reasoning_cooldown,
+                        "response_delay_s": conversation_cfg.response_delay,
+                        "llm_timeout_s": getattr(conversation_cfg, 'llm_timeout', 5.0),
+                    },
                     "source": "sdk",
                 }
 

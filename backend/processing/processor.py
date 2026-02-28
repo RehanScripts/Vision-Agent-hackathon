@@ -35,6 +35,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
+import pathlib
+
 import numpy as np
 
 from ..core.models import SpeakingMetrics
@@ -48,6 +50,11 @@ except ImportError:
     av = None  # type: ignore[assignment]
 
 try:
+    import cv2  # opencv for frame conversion fallback
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+
+try:
     import aiortc
 except ImportError:
     aiortc = None  # type: ignore[assignment]
@@ -56,6 +63,11 @@ try:
     import mediapipe as mp
 except ImportError:
     mp = None  # type: ignore[assignment]
+
+# -- MediaPipe model paths (Tasks API 0.10.x+) ------------------------------
+_MODELS_DIR = pathlib.Path(__file__).resolve().parent.parent / "models"
+_FACE_MODEL = _MODELS_DIR / "face_landmarker.task"
+_POSE_MODEL = _MODELS_DIR / "pose_landmarker_lite.task"
 
 try:
     from vision_agents.core.processors.base_processor import VideoProcessorPublisher
@@ -72,6 +84,11 @@ except ImportError:
     class QueuedVideoTrack:  # type: ignore[no-redef]
         pass
     pass
+
+# Watchdog: if no frames arrive via forwarder within this window, start direct reader
+_FORWARDER_WATCHDOG_TIMEOUT_S = 5.0
+# Direct reader FPS cap
+_DIRECT_READER_FPS = 5
 
 
 logger = logging.getLogger("speakai.processor")
@@ -118,6 +135,13 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         self.frames_processed: int = 0
         self.last_latency_ms: float = 0.0
 
+        # Direct frame reader (fallback when VideoForwarder doesn't fire)
+        self._direct_reader_task: Optional[asyncio.Task] = None
+        self._direct_reader_active = False
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._raw_track: Any = None  # The raw video track for direct reading
+        self._forwarder_started_at: float = 0.0
+
         # Output video track
         if _HAS_SDK:
             self._video_track = QueuedVideoTrack(
@@ -149,7 +173,9 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
     ) -> None:
         """
         Called by the Agent when a participant's video track appears.
-        We register a frame handler on the shared VideoForwarder.
+        We register a frame handler on the shared VideoForwarder AND
+        start a watchdog that falls back to direct frame reading if
+        the forwarder's callback never fires.
         """
         logger.info(
             f"🎥 process_video called: participant={participant_id}, "
@@ -158,10 +184,18 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             f"SDK={_HAS_SDK}"
         )
 
+        # Stop any previous processing
         if self._video_forwarder is not None:
             logger.info("Stopping previous video processing — new track published")
             if _HAS_SDK:
-                await self._video_forwarder.remove_frame_handler(self._on_frame)
+                try:
+                    await self._video_forwarder.remove_frame_handler(self._on_frame)
+                except Exception:
+                    pass
+        await self._stop_direct_reader()
+
+        # Store raw track for direct reader fallback
+        self._raw_track = track
 
         logger.info(f"Starting speaking coach video processing at {self.fps} FPS")
 
@@ -182,29 +216,172 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
                 self._video_forwarder.add_frame_handler(
                     self._on_frame, fps=float(self.fps), name="speaking_coach"
                 )
+                self._forwarder_started_at = time.time()
                 logger.info(
                     f"✅ Frame handler registered on forwarder "
                     f"(handlers={len(self._video_forwarder._frame_handlers)})"
                 )
             except Exception as e:
                 logger.error(f"❌ Failed to add frame handler: {e}", exc_info=True)
+                # Forwarder registration failed → go straight to direct reader
+                logger.info("⚡ Forwarder failed — starting direct frame reader immediately")
+                self._start_direct_reader()
+                return
         else:
             logger.warning(
-                f"⚠️ Cannot start video processing: "
+                f"⚠️ No forwarder available: "
                 f"forwarder={self._video_forwarder is not None}, SDK={_HAS_SDK}"
             )
+            # No forwarder at all → use direct reader
+            if track is not None:
+                logger.info("⚡ No SDK forwarder — starting direct frame reader")
+                self._start_direct_reader()
+                return
+
+        # Start watchdog to detect if forwarder callbacks aren't firing
+        self._start_watchdog()
 
         logger.info("✅ Speaking coach video processing pipeline started")
 
+    def _start_watchdog(self) -> None:
+        """Start a watchdog that monitors forwarder health and falls back to direct reading."""
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.ensure_future(self._forwarder_watchdog())
+
+    async def _forwarder_watchdog(self) -> None:
+        """
+        Monitors if the VideoForwarder callback is actually delivering frames.
+        If no frames arrive within _FORWARDER_WATCHDOG_TIMEOUT_S, switches to
+        the direct frame reader.
+        """
+        try:
+            await asyncio.sleep(_FORWARDER_WATCHDOG_TIMEOUT_S)
+            if self._shutdown:
+                return
+            if self.frames_processed == 0 and not self._direct_reader_active:
+                logger.warning(
+                    f"⏰ Watchdog: no frames received after {_FORWARDER_WATCHDOG_TIMEOUT_S}s "
+                    f"via VideoForwarder — switching to direct frame reader"
+                )
+                self._start_direct_reader()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Watchdog error: {e}")
+
+    def _start_direct_reader(self) -> None:
+        """Start the direct frame reading task from the raw track."""
+        if self._direct_reader_active or self._raw_track is None:
+            return
+        self._direct_reader_active = True
+        self._direct_reader_task = asyncio.ensure_future(self._direct_frame_reader())
+        logger.info("🔄 Direct frame reader started")
+
+    async def _stop_direct_reader(self) -> None:
+        """Stop the direct frame reader."""
+        self._direct_reader_active = False
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._direct_reader_task and not self._direct_reader_task.done():
+            self._direct_reader_task.cancel()
+            try:
+                await self._direct_reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._direct_reader_task = None
+        self._watchdog_task = None
+
+    async def _direct_frame_reader(self) -> None:
+        """
+        Fallback frame reader: directly pulls frames from the raw aiortc track
+        using track.recv(). This bypasses the VideoForwarder entirely.
+
+        This is the safety net for when the SDK's internal forwarding doesn't work.
+        """
+        track = self._raw_track
+        if track is None:
+            logger.warning("Direct reader: no track available")
+            return
+
+        interval = 1.0 / _DIRECT_READER_FPS
+        consecutive_errors = 0
+        max_errors = 20
+
+        logger.info(
+            f"🔄 Direct frame reader running at {_DIRECT_READER_FPS} FPS "
+            f"on track {type(track).__name__}"
+        )
+
+        while self._direct_reader_active and not self._shutdown:
+            try:
+                # Method 1: aiortc track.recv() — the standard WebRTC approach
+                if hasattr(track, 'recv'):
+                    frame = await asyncio.wait_for(track.recv(), timeout=5.0)
+                    await self._on_frame(frame)
+                    consecutive_errors = 0
+                # Method 2: If the track has an async iterator (livekit-style)
+                elif hasattr(track, '__aiter__'):
+                    async for frame in track:
+                        if not self._direct_reader_active or self._shutdown:
+                            break
+                        await self._on_frame(frame)
+                        consecutive_errors = 0
+                        await asyncio.sleep(interval)
+                    break  # Iterator exhausted
+                else:
+                    logger.warning(
+                        f"Direct reader: track type {type(track).__name__} "
+                        f"has no recv() or __aiter__ method. "
+                        f"Available: {[a for a in dir(track) if not a.startswith('_')]}"
+                    )
+                    break
+
+                await asyncio.sleep(interval)
+
+            except asyncio.TimeoutError:
+                consecutive_errors += 1
+                if consecutive_errors > max_errors:
+                    logger.warning(
+                        f"Direct reader: {max_errors} consecutive timeouts — stopping"
+                    )
+                    break
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors <= 3:
+                    logger.warning(f"Direct reader error: {e}", exc_info=True)
+                elif consecutive_errors > max_errors:
+                    logger.error(f"Direct reader: too many errors — stopping")
+                    break
+                await asyncio.sleep(0.5)
+
+        self._direct_reader_active = False
+        logger.info(
+            f"🔄 Direct frame reader stopped "
+            f"(processed {self.frames_processed} frames total)"
+        )
+
     async def stop_processing(self) -> None:
         """Called when all video tracks are removed (participant left)."""
+        # Stop direct reader + watchdog
+        await self._stop_direct_reader()
+
         if self._video_forwarder is not None and _HAS_SDK:
             try:
                 await self._video_forwarder.remove_frame_handler(self._on_frame)
             except Exception:
                 pass
             self._video_forwarder = None
-            logger.info("Stopped speaking coach video processing")
+
+        self._raw_track = None
+        logger.info("Stopped speaking coach video processing")
 
     async def close(self) -> None:
         """Clean up all resources."""
@@ -217,13 +394,20 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             self._pose.close()
         if self._video_track is not None and _HAS_SDK:
             self._video_track.stop()
-        logger.info("SpeakingCoachProcessor closed")
+        logger.info(
+            f"SpeakingCoachProcessor closed "
+            f"(total frames processed: {self.frames_processed})"
+        )
 
     # -- Frame handler (called by VideoForwarder) -----------------------------
 
     async def _on_frame(self, frame: Any) -> None:
         """
-        Receives an av.VideoFrame from the SDK's VideoForwarder.
+        Receives a video frame from either:
+          - The SDK's VideoForwarder (av.VideoFrame)
+          - The direct frame reader (av.VideoFrame from track.recv())
+          - A raw numpy array from an alternative pipeline
+
         Runs CV analysis in a thread pool, publishes metrics + annotated frame.
         """
         if self._shutdown:
@@ -234,15 +418,18 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
 
             # Log first frame arrival
             if self.frames_processed == 0:
+                source = "direct_reader" if self._direct_reader_active else "forwarder"
                 logger.info(
-                    f"🎬 FIRST VIDEO FRAME received! "
+                    f"🎬 FIRST VIDEO FRAME received via {source}! "
                     f"type={type(frame).__name__}, "
                     f"format={getattr(frame, 'format', 'unknown')}, "
                     f"size={getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}"
                 )
 
-            # Convert av.VideoFrame → numpy RGB
-            frame_rgb = frame.to_ndarray(format="rgb24")
+            # Convert to numpy RGB array
+            frame_rgb = self._frame_to_rgb(frame)
+            if frame_rgb is None:
+                return
 
             # Run MediaPipe analysis in thread pool (never blocks event loop)
             loop = asyncio.get_running_loop()
@@ -257,14 +444,15 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
 
             # Log periodically
             if self.frames_processed % 100 == 0:
+                source = "direct" if self._direct_reader_active else "forwarder"
                 logger.info(
-                    f"📊 Processed {self.frames_processed} frames, "
+                    f"📊 Processed {self.frames_processed} frames ({source}), "
                     f"latency={self.last_latency_ms:.1f}ms, "
                     f"eye={metrics.eye_contact:.0f}%, posture={metrics.posture_score:.0f}%"
                 )
 
             # Publish the (original) frame back into the call
-            if self._video_track is not None:
+            if self._video_track is not None and av is not None and isinstance(frame, av.VideoFrame):
                 await self._video_track.add_frame(frame)
 
         except Exception as e:
@@ -273,27 +461,96 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             else:
                 logger.debug(f"Frame processing error: {e}")
             # Pass through on error
-            if self._video_track is not None:
+            if self._video_track is not None and av is not None and isinstance(frame, av.VideoFrame):
                 try:
                     await self._video_track.add_frame(frame)
                 except Exception:
                     pass
 
+    def _frame_to_rgb(self, frame: Any) -> Optional[np.ndarray]:
+        """
+        Convert a frame from any format to a numpy RGB array.
+        Handles:
+          - av.VideoFrame → frame.to_ndarray(format="rgb24")
+          - numpy array → assume BGR (from cv2) or RGB
+          - Other types → attempt conversion
+        """
+        try:
+            # av.VideoFrame (from SDK's VideoForwarder or aiortc track.recv())
+            if av is not None and isinstance(frame, av.VideoFrame):
+                return frame.to_ndarray(format="rgb24")
+
+            # Raw numpy array
+            if isinstance(frame, np.ndarray):
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    return frame  # Assume RGB
+                if frame.ndim == 3 and frame.shape[2] == 4:
+                    return frame[:, :, :3]  # Drop alpha channel
+                return None
+
+            # Some SDKs provide frame.data as bytes
+            if hasattr(frame, 'data') and hasattr(frame, 'width') and hasattr(frame, 'height'):
+                w, h = frame.width, frame.height
+                data = frame.data
+                if isinstance(data, (bytes, bytearray)):
+                    arr = np.frombuffer(data, dtype=np.uint8)
+                    if arr.size == w * h * 3:
+                        return arr.reshape((h, w, 3))
+                    elif arr.size == w * h * 4:
+                        return arr.reshape((h, w, 4))[:, :, :3]
+
+            logger.debug(f"Unknown frame type: {type(frame).__name__}")
+            return None
+
+        except Exception as e:
+            logger.debug(f"Frame conversion error: {e}")
+            return None
+
     # -- MediaPipe sync analysis (runs in thread pool) ------------------------
 
     def _init_mediapipe(self) -> None:
-        """Lazy-init MediaPipe models (only in worker thread)."""
+        """Lazy-init MediaPipe models using the Tasks API (0.10.x+)."""
         if self._mp_initialized:
             return
         if mp is not None:
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False, max_num_faces=1, refine_landmarks=True,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5,
-            )
-            self._pose = mp.solutions.pose.Pose(
-                static_image_mode=False, model_complexity=0,
-                min_detection_confidence=0.5, min_tracking_confidence=0.5,
-            )
+            try:
+                BaseOptions = mp.tasks.BaseOptions
+                FaceLandmarker = mp.tasks.vision.FaceLandmarker
+                FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+                PoseLandmarker = mp.tasks.vision.PoseLandmarker
+                PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+                RunningMode = mp.tasks.vision.RunningMode
+
+                if _FACE_MODEL.exists():
+                    face_opts = FaceLandmarkerOptions(
+                        base_options=BaseOptions(model_asset_path=str(_FACE_MODEL)),
+                        running_mode=RunningMode.IMAGE,
+                        num_faces=1,
+                        min_face_detection_confidence=0.5,
+                        min_face_presence_confidence=0.5,
+                        min_tracking_confidence=0.5,
+                        output_face_blendshapes=False,
+                        output_facial_transformation_matrixes=False,
+                    )
+                    self._face_mesh = FaceLandmarker.create_from_options(face_opts)
+                    logger.info("FaceLandmarker loaded (Tasks API)")
+                else:
+                    logger.warning(f"Face model not found: {_FACE_MODEL}")
+
+                if _POSE_MODEL.exists():
+                    pose_opts = PoseLandmarkerOptions(
+                        base_options=BaseOptions(model_asset_path=str(_POSE_MODEL)),
+                        running_mode=RunningMode.IMAGE,
+                        min_pose_detection_confidence=0.5,
+                        min_tracking_confidence=0.5,
+                    )
+                    self._pose = PoseLandmarker.create_from_options(pose_opts)
+                    logger.info("PoseLandmarker loaded (Tasks API)")
+                else:
+                    logger.warning(f"Pose model not found: {_POSE_MODEL}")
+
+            except Exception as e:
+                logger.warning(f"Failed to init MediaPipe Tasks: {e}", exc_info=True)
         self._mp_initialized = True
 
     def _analyze_sync(self, frame_rgb: np.ndarray) -> SpeakingMetrics:
@@ -307,11 +564,12 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             return SpeakingMetrics(timestamp=time.time(), source="no_mediapipe")
 
         h, w, _ = frame_rgb.shape
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
         try:
-            face = self._face_mesh.process(frame_rgb)
-            if face.multi_face_landmarks:
-                fl = face.multi_face_landmarks[0].landmark
+            face_result = self._face_mesh.detect(mp_image)
+            if face_result.face_landmarks:
+                fl = face_result.face_landmarks[0]  # List[NormalizedLandmark]
                 m.eye_contact = self._eye_contact(fl, w, h)
                 m.head_stability = self._head_stability(fl, w, h)
                 m.facial_engagement = self._facial_engagement(fl, h)
@@ -319,9 +577,9 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             pass
 
         try:
-            pose = self._pose.process(frame_rgb)
-            if pose.pose_landmarks:
-                m.posture_score = self._posture(pose.pose_landmarks.landmark)
+            pose_result = self._pose.detect(mp_image)
+            if pose_result.pose_landmarks:
+                m.posture_score = self._posture(pose_result.pose_landmarks[0])
         except Exception:
             pass
 

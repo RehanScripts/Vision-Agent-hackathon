@@ -14,6 +14,7 @@ certifi
 # Computer Vision (used inside SpeakingCoachProcessor for per-frame analysis)
 numpy
 mediapipe
+opencv-python-headless
 
 # PyAV — required by Vision Agents SDK for av.VideoFrame
 av
