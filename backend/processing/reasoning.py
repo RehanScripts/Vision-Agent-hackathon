@@ -150,12 +150,11 @@ class ReasoningEngine:
         if agent is not None and hasattr(agent, "llm"):
             try:
                 prompt = (
-                    f"Speaker: eye {metrics.eye_contact:.0f}%, "
+                    f"Eye {metrics.eye_contact:.0f}%, "
                     f"stability {metrics.head_stability:.0f}%, "
                     f"posture {metrics.posture_score:.0f}%, "
-                    f"engagement {metrics.facial_engagement:.0f}%, "
                     f"WPM {metrics.words_per_minute}. "
-                    "ONE coaching tip in ≤15 words."
+                    "ONE tip in ≤10 words."
                 )
                 response = await asyncio.wait_for(
                     agent.llm.simple_response(prompt),

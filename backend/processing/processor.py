@@ -112,7 +112,7 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         self._prev_nose: Optional[np.ndarray] = None
 
         # Latest metrics (for reasoning engine to read)
-        self._latest_metrics = SpeakingMetrics(source="sdk")
+        self._latest_metrics = SpeakingMetrics(timestamp=0.0, source="sdk")
 
         # Telemetry
         self.frames_processed: int = 0
@@ -151,6 +151,13 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         Called by the Agent when a participant's video track appears.
         We register a frame handler on the shared VideoForwarder.
         """
+        logger.info(
+            f"🎥 process_video called: participant={participant_id}, "
+            f"track={type(track).__name__}, "
+            f"forwarder={'shared' if shared_forwarder else 'none'}, "
+            f"SDK={_HAS_SDK}"
+        )
+
         if self._video_forwarder is not None:
             logger.info("Stopping previous video processing — new track published")
             if _HAS_SDK:
@@ -160,6 +167,7 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
 
         if shared_forwarder is not None and _HAS_SDK:
             self._video_forwarder = shared_forwarder
+            logger.info(f"Using shared forwarder: {type(shared_forwarder).__name__}")
         elif _HAS_SDK:
             self._video_forwarder = VideoForwarder(
                 track,
@@ -167,10 +175,23 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
                 fps=self.fps,
                 name="speaking_coach_forwarder",
             )
+            logger.info("Created dedicated VideoForwarder")
 
         if self._video_forwarder is not None and _HAS_SDK:
-            self._video_forwarder.add_frame_handler(
-                self._on_frame, fps=float(self.fps), name="speaking_coach"
+            try:
+                self._video_forwarder.add_frame_handler(
+                    self._on_frame, fps=float(self.fps), name="speaking_coach"
+                )
+                logger.info(
+                    f"✅ Frame handler registered on forwarder "
+                    f"(handlers={len(self._video_forwarder._frame_handlers)})"
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to add frame handler: {e}", exc_info=True)
+        else:
+            logger.warning(
+                f"⚠️ Cannot start video processing: "
+                f"forwarder={self._video_forwarder is not None}, SDK={_HAS_SDK}"
             )
 
         logger.info("✅ Speaking coach video processing pipeline started")
@@ -211,6 +232,15 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         try:
             t0 = time.perf_counter()
 
+            # Log first frame arrival
+            if self.frames_processed == 0:
+                logger.info(
+                    f"🎬 FIRST VIDEO FRAME received! "
+                    f"type={type(frame).__name__}, "
+                    f"format={getattr(frame, 'format', 'unknown')}, "
+                    f"size={getattr(frame, 'width', '?')}x{getattr(frame, 'height', '?')}"
+                )
+
             # Convert av.VideoFrame → numpy RGB
             frame_rgb = frame.to_ndarray(format="rgb24")
 
@@ -225,12 +255,23 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             self.frames_processed += 1
             self._latest_metrics = metrics
 
+            # Log periodically
+            if self.frames_processed % 100 == 0:
+                logger.info(
+                    f"📊 Processed {self.frames_processed} frames, "
+                    f"latency={self.last_latency_ms:.1f}ms, "
+                    f"eye={metrics.eye_contact:.0f}%, posture={metrics.posture_score:.0f}%"
+                )
+
             # Publish the (original) frame back into the call
             if self._video_track is not None:
                 await self._video_track.add_frame(frame)
 
         except Exception as e:
-            logger.debug(f"Frame processing error: {e}")
+            if self.frames_processed == 0:
+                logger.warning(f"⚠️ Frame processing error (first frame): {e}", exc_info=True)
+            else:
+                logger.debug(f"Frame processing error: {e}")
             # Pass through on error
             if self._video_track is not None:
                 try:
@@ -262,7 +303,8 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         m = SpeakingMetrics(timestamp=time.time(), source="sdk")
 
         if self._face_mesh is None or self._pose is None:
-            return self._simulated_metrics()
+            # No MediaPipe available — return zeros (honest, no fake data)
+            return SpeakingMetrics(timestamp=time.time(), source="no_mediapipe")
 
         h, w, _ = frame_rgb.shape
 
@@ -337,18 +379,3 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             return round(0.5 * sscore + 0.5 * sp_score, 1)
         except Exception:
             return 75.0
-
-    def _simulated_metrics(self) -> SpeakingMetrics:
-        import random
-        t = time.time()
-        return SpeakingMetrics(
-            eye_contact=round(75 + 20 * np.sin(t * 0.5) + random.uniform(-3, 3), 1),
-            head_stability=round(85 + 10 * np.sin(t * 0.3) + random.uniform(-2, 2), 1),
-            posture_score=round(88 + 8 * np.sin(t * 0.2) + random.uniform(-2, 2), 1),
-            facial_engagement=round(70 + 15 * np.sin(t * 0.4) + random.uniform(-3, 3), 1),
-            attention_intensity=round(80 + 12 * np.sin(t * 0.35) + random.uniform(-2, 2), 1),
-            words_per_minute=int(130 + 20 * np.sin(t * 0.1) + random.uniform(-5, 5)),
-            filler_words=max(0, int(3 + 2 * np.sin(t * 0.2) + random.uniform(-1, 1))),
-            timestamp=t,
-            source="simulated",
-        )

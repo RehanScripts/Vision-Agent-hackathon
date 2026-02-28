@@ -45,12 +45,52 @@ from ..core.models import (
     TranscriptEntry,
     ConversationState,
 )
+from ..core.state_machine import SessionStateMachine, SessionState, SessionMode
+from ..core.health import SessionPolicy
+from ..core.latency import LatencyTracer
 from ..processing.processor import SpeakingCoachProcessor
 from ..processing.reasoning import ReasoningEngine
 from ..processing.audio_processor import AudioProcessor
 from ..processing.conversation import ConversationManager
 
 logger = logging.getLogger("speakai.service")
+
+# SDK event types (imported lazily at runtime)
+_sdk_event_types_loaded = False
+_RealtimeUserSpeechTranscriptionEvent = None
+_RealtimeAgentSpeechTranscriptionEvent = None
+_TrackAddedEvent = None
+_TrackRemovedEvent = None
+
+
+def _load_sdk_event_types() -> None:
+    """Lazy-load SDK event types to avoid import errors."""
+    global _sdk_event_types_loaded
+    global _RealtimeUserSpeechTranscriptionEvent
+    global _RealtimeAgentSpeechTranscriptionEvent
+    global _TrackAddedEvent, _TrackRemovedEvent
+
+    if _sdk_event_types_loaded:
+        return
+
+    try:
+        from vision_agents.core.llm.events import (
+            RealtimeUserSpeechTranscriptionEvent,
+            RealtimeAgentSpeechTranscriptionEvent,
+        )
+        _RealtimeUserSpeechTranscriptionEvent = RealtimeUserSpeechTranscriptionEvent
+        _RealtimeAgentSpeechTranscriptionEvent = RealtimeAgentSpeechTranscriptionEvent
+    except ImportError:
+        pass
+
+    try:
+        from vision_agents.core.edge.events import TrackAddedEvent, TrackRemovedEvent
+        _TrackAddedEvent = TrackAddedEvent
+        _TrackRemovedEvent = TrackRemovedEvent
+    except ImportError:
+        pass
+
+    _sdk_event_types_loaded = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -103,7 +143,14 @@ class AIService:
         self._status_task: Optional[asyncio.Task] = None
         self._metrics_listener_task: Optional[asyncio.Task] = None
 
-        # State
+        # State machine + policy layer + latency tracer
+        self._state_machine = SessionStateMachine(
+            on_transition=self._on_state_transition,
+        )
+        self._policy = SessionPolicy()
+        self._latency = LatencyTracer(session_id)
+
+        # Legacy state (kept for backward compat during migration)
         self._reasoning = ReasoningEngine()
         self._active = False
         self._started_at: Optional[float] = None
@@ -112,6 +159,7 @@ class AIService:
         self._join_error: Optional[str] = None
         self._pending_chat: deque[str] = deque(maxlen=50)
         self._starting = False
+        self._latest_emitted_metrics: Optional[SpeakingMetrics] = None
 
     @property
     def is_active(self) -> bool:
@@ -119,9 +167,54 @@ class AIService:
 
     @property
     def latest_metrics(self) -> SpeakingMetrics:
+        if self._processor and self._processor.frames_processed > 0:
+            return self._processor.latest
+        # In audio-only mode, return the last emitted audio-only metrics
+        if self._latest_emitted_metrics and self._latest_emitted_metrics.timestamp > 0:
+            return self._latest_emitted_metrics
         if self._processor:
             return self._processor.latest
         return SpeakingMetrics()
+
+    # ── State machine callback ──────────────────────────────────────────
+
+    def _on_state_transition(
+        self, prev: SessionState, new: SessionState, reason: str
+    ) -> None:
+        """Called on every state transition — updates telemetry and emits to frontend."""
+        self.telemetry.session_state = new.value
+        self.telemetry.session_mode = self._state_machine.mode.value
+
+        # Propagate mode to conversation manager for context
+        if self._conversation:
+            self._conversation.set_session_mode(self._state_machine.mode.value)
+
+        # Emit state change to frontend
+        if self._on_status:
+            import asyncio as _aio
+            try:
+                loop = _aio.get_running_loop()
+                loop.create_task(self._emit_state_change(prev, new, reason))
+            except RuntimeError:
+                pass  # No event loop — skip
+
+    async def _emit_state_change(
+        self, prev: SessionState, new: SessionState, reason: str
+    ) -> None:
+        """Push state transition to frontend via status callback."""
+        status = {
+            "type": "state_transition",
+            "session_state": new.value,
+            "session_mode": self._state_machine.mode.value,
+            "previous_state": prev.value,
+            "reason": reason,
+            "health": self._policy.check_health().to_dict(),
+            "latency": self._latency.summary(),
+        }
+        if self._on_status:
+            cb = self._on_status(status)
+            if asyncio.iscoroutine(cb):
+                await cb
 
     @property
     def conversation_messages(self) -> List[ChatMessage]:
@@ -168,6 +261,9 @@ class AIService:
         self._join_error = None
         self._starting = True
         self.telemetry.call_id = call_id
+
+        # ── LATENCY: mark join start ────────────────────────────────────
+        self._latency.mark_join_started()
 
         try:
             from vision_agents.core import Agent, User
@@ -220,38 +316,45 @@ class AIService:
                     await agent.create_user()
                     call = await agent.create_call(call_type, call_id)
 
-                    logger.info(f"[{self.session_id}] 🤖 Agent joining call {call_id}...")
+                    logger.info(f"[{self.session_id}] Agent joining call {call_id}...")
 
-                    async with agent.join(call):
-                        logger.info(f"[{self.session_id}] 🤖 Agent joined call {call_id}")
+                    async with agent.join(call, participant_wait_timeout=0):
+                        logger.info(f"[{self.session_id}] Agent joined call {call_id}")
                         self._agent = agent
 
+                        # ── LATENCY: mark agent joined ─────────────────
+                        self._latency.mark_agent_joined()
+
+                        # ── STATE: INIT → READY ────────────────────────
+                        self._policy.report_agent_joined(True)
+                        self._policy.report_model_state(True)
+                        try:
+                            self._state_machine.transition(
+                                SessionState.READY, reason="agent_joined_call"
+                            )
+                        except ValueError as e:
+                            logger.warning(f"[{self.session_id}] State transition: {e}")
+
                         # Attach agent to sub-processors
+                        self._processor.attach_agent(agent)
                         self._audio_processor.attach_agent(agent)
                         self._conversation.attach_agent(agent)
 
-                        # Subscribe to audio tracks for processing
-                        if hasattr(agent, "on"):
-                            try:
-                                agent.on("track_subscribed", self._on_track_subscribed)
-                                agent.on("participant_joined", self._on_participant_joined)
-                                agent.on("participant_left", self._on_participant_left)
-                            except Exception as e:
-                                logger.debug(f"Agent event subscription: {e}")
+                        # Report audio as active (SDK handles audio transport)
+                        self._policy.report_audio_state(True)
+
+                        # Subscribe to SDK events via proper event bus
+                        _load_sdk_event_types()
+                        try:
+                            agent.subscribe(self._on_sdk_event)
+                            logger.info(f"[{self.session_id}] Subscribed to agent event bus")
+                        except Exception as e:
+                            logger.warning(f"[{self.session_id}] Agent event subscription failed: {e}")
 
                         # Start conversation manager
                         await self._conversation.start()
 
                         self._join_ready.set()
-
-                        # Agent is now live — it will:
-                        # • Subscribe to participant audio/video tracks automatically
-                        # • Forward video frames to our SpeakingCoachProcessor
-                        # • Forward audio to Gemini Realtime for multimodal understanding
-                        # • Our AudioProcessor extracts speech metrics + transcript
-                        # • ConversationManager handles turn-taking + responses
-                        # • Generate TTS audio responses via ElevenLabs
-                        # • Publish TTS audio back into the call
 
                         await agent.finish()  # Block until call ends
                 except Exception as exc:
@@ -277,17 +380,24 @@ class AIService:
             try:
                 await asyncio.wait_for(self._join_ready.wait(), timeout=15.0)
             except asyncio.TimeoutError:
+                self._state_machine.transition(SessionState.FAILED, reason="join_timeout")
                 raise RuntimeError("Agent join timed out")
 
             if self._join_error:
+                self._state_machine.transition(SessionState.FAILED, reason=self._join_error)
                 raise RuntimeError(self._join_error)
 
             self._active = True
             self._starting = False
             self.telemetry.sdk_active = True
-            self.telemetry.multimodal_active = True
             self.telemetry.agent_joined = True
             self.telemetry.audio_active = True
+
+            # ── POLICY: determine initial mode (NOT multimodal until video arrives) ──
+            mode = self._policy.determine_mode()
+            self._state_machine.set_mode(mode)
+            self.telemetry.session_mode = mode.value
+            self.telemetry.multimodal_active = (mode == SessionMode.MULTIMODAL)
 
             # Start background workers
             self._reasoning_task = asyncio.create_task(
@@ -299,67 +409,147 @@ class AIService:
             self._metrics_listener_task = asyncio.create_task(
                 self._metrics_listener(), name=f"metrics-{self.session_id}"
             )
+            # Health monitor — drives state machine transitions
+            self._health_task = asyncio.create_task(
+                self._health_monitor(), name=f"health-{self.session_id}"
+            )
 
             logger.info(
-                f"[{self.session_id}] ✅ AI Service started — "
-                f"Agent joined call '{call_id}' as real participant with communication"
+                f"[{self.session_id}] AI Service started — "
+                f"state={self._state_machine.state.value}, "
+                f"mode={self._state_machine.mode.value}, "
+                f"call='{call_id}'"
             )
 
             return {
                 "session_id": self.session_id,
                 "call_id": call_id,
                 "agent_id": f"speakai-{self.session_id[:8]}",
+                "session_state": self._state_machine.state.value,
+                "session_mode": self._state_machine.mode.value,
                 "sdk_active": True,
-                "multimodal_active": True,
+                "multimodal_active": self.telemetry.multimodal_active,
                 "audio_active": True,
                 "conversation_active": True,
-                "mode": "live",
             }
 
         except ImportError as e:
             logger.warning(f"[{self.session_id}] SDK import failed: {e}")
             self.telemetry.sdk_active = False
             self._starting = False
+            try:
+                self._state_machine.transition(SessionState.FAILED, reason=f"import_error: {e}")
+            except ValueError:
+                pass
             raise
         except Exception as e:
             logger.error(f"[{self.session_id}] AI Service start failed: {e}", exc_info=True)
             self.telemetry.sdk_active = False
             self._starting = False
+            try:
+                self._state_machine.transition(SessionState.FAILED, reason=str(e)[:100])
+            except ValueError:
+                pass
             raise
 
-    # ── Track subscription (audio + video) ──────────────────────────────
+    # ── SDK Event Handler (unified event bus) ──────────────────────────
 
-    async def _on_track_subscribed(self, event: Any) -> None:
-        """Called when a media track from a participant is subscribed."""
+    async def _on_sdk_event(self, event: Any) -> None:
+        """
+        Unified handler for ALL events from the Agent's event bus.
+        Handles: transcription, track lifecycle, conversation items.
+        """
         try:
-            track = getattr(event, "track", None)
-            participant_id = getattr(event, "participant_id", None)
-            track_kind = getattr(track, "kind", "unknown")
+            event_type = getattr(event, "type", type(event).__name__)
 
-            if track_kind == "audio" and self._audio_processor:
-                logger.info(
-                    f"[{self.session_id}] Audio track subscribed: {participant_id}"
-                )
-                await self._audio_processor.process_audio(track, participant_id)
+            # ── User speech transcription → filler words, WPM, transcript ──
+            if _RealtimeUserSpeechTranscriptionEvent and isinstance(
+                event, _RealtimeUserSpeechTranscriptionEvent
+            ):
+                text = getattr(event, "text", "").strip()
+                if text:
+                    logger.info(f"[{self.session_id}] User speech: {text[:80]}")
 
-            elif track_kind == "video":
+                    # ── LATENCY: mark first transcript ──
+                    self._latency.mark_first_transcript()
+
+                    # Update audio processor with real transcript
+                    if self._audio_processor:
+                        await self._audio_processor.handle_user_transcript(text)
+
+                    # Forward as transcript entry
+                    entry = TranscriptEntry(
+                        speaker="user",
+                        text=text,
+                        timestamp=time.time(),
+                        confidence=1.0,
+                        is_final=True,
+                    )
+                    if self._on_transcript:
+                        cb = self._on_transcript(entry)
+                        if asyncio.iscoroutine(cb):
+                            await cb
+
+                    # Forward to conversation manager
+                    if self._conversation:
+                        await self._conversation.handle_transcript(entry)
+
+            # ── Agent speech transcription → track agent responses ──
+            elif _RealtimeAgentSpeechTranscriptionEvent and isinstance(
+                event, _RealtimeAgentSpeechTranscriptionEvent
+            ):
+                text = getattr(event, "text", "").strip()
+                if text:
+                    logger.info(f"[{self.session_id}] Agent speech: {text[:80]}")
+
+                    # Forward as chat message
+                    msg = ChatMessage(
+                        id=f"agent-{int(time.time()*1000)}",
+                        role="assistant",
+                        content=text,
+                        timestamp=time.time(),
+                        source="voice",
+                    )
+                    if self._on_chat:
+                        cb = self._on_chat(msg)
+                        if asyncio.iscoroutine(cb):
+                            await cb
+
+                    # Update conversation state
+                    if self._conversation:
+                        self._conversation._state.last_agent_response = text[:200]
+
+            # ── Track lifecycle events ──
+            elif _TrackAddedEvent and isinstance(event, _TrackAddedEvent):
+                track_type = getattr(event, "track_type", "unknown")
+                track_id = getattr(event, "track_id", "unknown")
                 logger.info(
-                    f"[{self.session_id}] Video track subscribed: {participant_id}"
+                    f"[{self.session_id}] Track added: type={track_type}, id={track_id}"
                 )
-                # Video is already handled by SpeakingCoachProcessor via SDK
+                # Report to policy layer
+                if str(track_type).lower() in ("video", "screenshare"):
+                    self._policy.report_frame()  # First track arrival = first frame signal
+                if str(track_type).lower() == "audio":
+                    self._policy.report_audio_state(True)
+
+            elif _TrackRemovedEvent and isinstance(event, _TrackRemovedEvent):
+                track_id = getattr(event, "track_id", "unknown")
+                logger.info(f"[{self.session_id}] Track removed: id={track_id}")
+
+            else:
+                # Log ALL other events for debugging
+                if not hasattr(self, "_event_type_counts"):
+                    self._event_type_counts: Dict[str, int] = {}
+                count = self._event_type_counts.get(event_type, 0) + 1
+                self._event_type_counts[event_type] = count
+                if count <= 5:
+                    logger.info(
+                        f"[{self.session_id}] SDK event: {event_type} "
+                        f"(#{count}) attrs={list(vars(event).keys()) if hasattr(event, '__dict__') else '?'}"
+                    )
 
         except Exception as e:
-            logger.debug(f"[{self.session_id}] Track subscription handler: {e}")
-
-    async def _on_participant_joined(self, event: Any = None) -> None:
-        """Log when a participant joins the call."""
-        pid = getattr(event, "participant_id", "unknown") if event else "unknown"
-        logger.info(f"[{self.session_id}] Participant joined: {pid}")
-
-    async def _on_participant_left(self, event: Any = None) -> None:
-        """Handle participant leaving the call."""
-        pid = getattr(event, "participant_id", "unknown") if event else "unknown"
-        logger.info(f"[{self.session_id}] Participant left: {pid}")
+            logger.debug(f"[{self.session_id}] SDK event handler error: {e}")
 
     # ── Communication event handlers ────────────────────────────────────
 
@@ -404,21 +594,21 @@ class AIService:
     async def _handle_agent_speech(self, text: str) -> None:
         """
         Called when the ConversationManager wants the agent to speak.
-        The Agent's TTS module handles synthesis + publishing into the call.
+        Uses agent.say() which sends AgentSayEvent → TTS pipeline → audio in call.
         """
-        if self._agent and hasattr(self._agent, "tts"):
-            try:
-                # The Vision Agent's TTS plugin synthesizes and publishes
-                # audio directly into the Stream Video call
-                await self._agent.tts.say(text)
-                logger.info(f"[{self.session_id}] Agent spoke: {text[:60]}...")
-            except Exception as e:
-                logger.warning(f"[{self.session_id}] TTS failed: {e}")
-        elif self._agent and hasattr(self._agent, "say"):
-            try:
-                await self._agent.say(text)
-            except Exception as e:
-                logger.warning(f"[{self.session_id}] Agent say failed: {e}")
+        if not self._agent:
+            logger.warning(f"[{self.session_id}] Cannot speak — agent not ready")
+            return
+
+        try:
+            await self._agent.say(text)
+
+            # ── LATENCY: mark first response ──
+            self._latency.mark_first_response()
+
+            logger.info(f"[{self.session_id}] Agent spoke: {text[:80]}...")
+        except Exception as e:
+            logger.error(f"[{self.session_id}] Agent say failed: {e}", exc_info=True)
 
     # ── Stop: tear down agent + workers ─────────────────────────────────
 
@@ -427,6 +617,12 @@ class AIService:
         self._active = False
         self._starting = False
         duration = time.time() - (self._started_at or time.time())
+
+        # ── STATE: reset to INIT ──
+        try:
+            self._state_machine.reset()
+        except Exception:
+            pass
 
         # Stop conversation manager
         conversation_summary = {}
@@ -437,8 +633,10 @@ class AIService:
         if self._audio_processor:
             await self._audio_processor.close()
 
-        # Cancel background tasks
-        for task in [self._reasoning_task, self._status_task, self._metrics_listener_task]:
+        # Cancel background tasks (including health monitor)
+        for task in [self._reasoning_task, self._status_task,
+                     self._metrics_listener_task,
+                     getattr(self, '_health_task', None)]:
             if task and not task.done():
                 task.cancel()
                 try:
@@ -471,6 +669,7 @@ class AIService:
             "duration_seconds": round(duration, 1),
             **self.telemetry.to_dict(),
             "conversation": conversation_summary,
+            "latency": self._latency.summary(),
         }
         logger.info(f"[{self.session_id}] AI Service stopped — {summary}")
         return summary
@@ -480,7 +679,13 @@ class AIService:
     async def _metrics_listener(self) -> None:
         """
         Poll the processor's latest metrics and forward to the callback.
-        Augments video metrics with audio-derived data.
+
+        PRODUCTION INTEGRITY:
+        - Only real MediaPipe metrics are forwarded in multimodal mode.
+        - In audio-only mode, only audio-derived metrics (WPM, fillers) are sent
+          with visual fields explicitly zeroed and source="audio_only".
+        - NO silent fallback generation. If no data exists, nothing is sent.
+        - The policy layer gates all emission decisions.
         """
         fps = processing_cfg.processor_fps
         interval = 1.0 / fps if fps > 0 else 0.2
@@ -491,9 +696,39 @@ class AIService:
                 if not self._active or self._processor is None:
                     break
 
-                metrics = self._processor.latest
+                has_video_frames = self._processor.frames_processed > 0
 
-                # Augment with audio metrics (WPM, filler words)
+                if has_video_frames:
+                    # Real MediaPipe metrics from processed video frames
+                    metrics = self._processor.latest
+
+                    # ── POLICY: report frame to health system ──
+                    self._policy.report_frame(metrics.timestamp)
+
+                    # ── LATENCY: mark first frame ──
+                    self._latency.mark_first_frame()
+                else:
+                    # ── NO SILENT FALLBACK ──
+                    # In audio-only mode, emit audio-derived metrics only.
+                    # Visual fields stay at zero — never fabricated.
+                    mode = self._state_machine.mode
+                    if mode == SessionMode.AUDIO_ONLY and self._audio_processor:
+                        metrics = SpeakingMetrics(
+                            eye_contact=0.0,
+                            head_stability=0.0,
+                            posture_score=0.0,
+                            facial_engagement=0.0,
+                            attention_intensity=0.0,
+                            words_per_minute=self._audio_processor.current_wpm,
+                            filler_words=self._audio_processor.total_fillers,
+                            timestamp=time.time(),
+                            source="audio_only",
+                        )
+                    else:
+                        # No data at all — skip emission
+                        continue
+
+                # Augment with audio metrics (WPM, filler words) — real data
                 if self._audio_processor:
                     metrics = self._audio_processor.update_metrics(metrics)
 
@@ -501,12 +736,17 @@ class AIService:
                 if self._conversation:
                     self._conversation.update_metrics(metrics)
 
-                if (
-                    metrics.timestamp > 0
-                    and metrics.timestamp != self._last_metrics_timestamp
-                    and self._on_metrics
-                ):
+                # ── POLICY: gate emission ──
+                if not self._policy.should_emit_metrics(metrics):
+                    continue
+
+                if metrics.timestamp > 0 and self._on_metrics:
+                    # Skip duplicate timestamps (only for real video frames)
+                    if has_video_frames and metrics.timestamp == self._last_metrics_timestamp:
+                        continue
+
                     self._last_metrics_timestamp = metrics.timestamp
+                    self._latest_emitted_metrics = metrics
                     self.telemetry.frames_processed = self._processor.frames_processed
                     self.telemetry.last_frame_latency_ms = self._processor.last_latency_ms
                     self.telemetry.sdk_inferences += 1
@@ -526,9 +766,13 @@ class AIService:
         """
         Runs at ~3 s intervals. Calls LLM (with timeout) or falls back to rules.
         NEVER runs per-frame.
+        Freshness-gated: skips reasoning when metrics are stale.
         """
         logger.info(f"[{self.session_id}] Reasoning worker started")
         last_reasoning_metrics_ts = 0.0
+
+        # Short warmup so initial metrics settle
+        await asyncio.sleep(1.0)
 
         while self._active:
             try:
@@ -541,6 +785,15 @@ class AIService:
                     continue
 
                 if metrics.timestamp == last_reasoning_metrics_ts:
+                    continue
+
+                # ── FRESHNESS GATE: skip stale/synthetic metrics ──
+                if not self._policy.validate_freshness(metrics):
+                    logger.debug(
+                        f"[{self.session_id}] Reasoning skipped: "
+                        f"stale metrics (age={time.time() - metrics.timestamp:.1f}s, "
+                        f"source={metrics.source})"
+                    )
                     continue
 
                 last_reasoning_metrics_ts = metrics.timestamp
@@ -580,20 +833,41 @@ class AIService:
                     self._conversation.state.to_dict() if self._conversation else {}
                 )
 
+                audio_stats = {}
+                if self._audio_processor:
+                    audio_stats = {
+                        "wpm": self._audio_processor.current_wpm,
+                        "total_words": self._audio_processor.total_words,
+                        "total_fillers": self._audio_processor.total_fillers,
+                        "is_speaking": self._audio_processor.is_user_speaking,
+                    }
+
+                # ── POLICY: diagnostics from the policy layer ──
+                policy_diag = self._policy.diagnostics()
+
                 status = {
                     "session_id": self.session_id,
                     "call_id": self.telemetry.call_id,
+                    # ── Explicit state + mode (requirement #2, #5) ──
+                    "session_state": self._state_machine.state.value,
+                    "session_mode": self._state_machine.mode.value,
+                    # ── Legacy fields for backward compatibility ──
                     "sdk_active": self.telemetry.sdk_active,
                     "multimodal_active": self.telemetry.multimodal_active,
                     "agent_joined": self.telemetry.agent_joined,
                     "audio_active": self.telemetry.audio_active,
                     "frames_processed": self.telemetry.frames_processed,
+                    "metrics_source": self._state_machine.mode.value,
                     "inference_latency_ms": self.telemetry.last_frame_latency_ms,
                     "reasoning_latency_ms": self.telemetry.last_reasoning_latency_ms,
                     "transcript_entries": self.telemetry.transcript_entries,
                     "chat_messages": self.telemetry.chat_messages,
                     "conversation_turns": self.telemetry.conversation_turns,
                     "conversation": conversation_state,
+                    "audio": audio_stats,
+                    # ── Health + latency diagnostics ──
+                    "health": policy_diag.get("health", {}),
+                    "latency": self._latency.summary(),
                     "source": "sdk",
                 }
 
@@ -606,3 +880,54 @@ class AIService:
                 break
             except Exception:
                 pass
+
+    # ── Health monitor (drives state machine) ───────────────────────────
+
+    async def _health_monitor(self) -> None:
+        """
+        Periodically evaluates system health and drives state transitions.
+
+        This is the ONLY place state transitions happen during normal operation.
+        The policy layer determines what state to be in; this worker enforces it.
+        """
+        logger.info(f"[{self.session_id}] Health monitor started")
+
+        while self._active:
+            try:
+                await asyncio.sleep(2.0)
+                if not self._active:
+                    break
+
+                # Ask policy what state we should be in
+                recommended = self._policy.determine_state()
+                current = self._state_machine.state
+
+                # Don't attempt transitions from FAILED or INIT
+                if current in (SessionState.FAILED, SessionState.INIT):
+                    continue
+
+                # Attempt transition if state changed
+                if recommended != current:
+                    try:
+                        health = self._policy.check_health()
+                        reason = (
+                            f"health_check: video={health.video}, "
+                            f"audio={health.audio}, model={health.model}"
+                        )
+                        self._state_machine.transition(recommended, reason=reason)
+                    except ValueError as e:
+                        logger.debug(f"[{self.session_id}] Health transition blocked: {e}")
+
+                # Always update mode
+                mode = self._policy.determine_mode()
+                self._state_machine.set_mode(mode)
+                self.telemetry.session_state = self._state_machine.state.value
+                self.telemetry.session_mode = mode.value
+                self.telemetry.multimodal_active = (mode == SessionMode.MULTIMODAL)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Health monitor error: {e}")
+
+        logger.info(f"[{self.session_id}] Health monitor stopped")

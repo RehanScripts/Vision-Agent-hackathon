@@ -68,15 +68,15 @@ class SDKConfig:
 @dataclass(frozen=True)
 class ProcessingConfig:
     # Coaching reasoning cooldown (seconds between LLM reasoning calls)
-    reasoning_cooldown: float = 1.5
+    reasoning_cooldown: float = 0.8
     # Hard timeout for a single LLM reasoning call
-    reasoning_timeout: float = 2.5
+    reasoning_timeout: float = 1.5
     # Threshold-feedback cooldown
-    feedback_cooldown: float = 2.0
+    feedback_cooldown: float = 1.0
     # Status broadcast interval
-    status_broadcast_interval: float = 2.0
+    status_broadcast_interval: float = 1.0
     # Frame processing FPS for the SpeakingCoachProcessor
-    processor_fps: int = 8
+    processor_fps: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -88,17 +88,17 @@ class ConversationConfig:
     # Max conversation history entries to keep in context
     max_context_messages: int = 30
     # Silence threshold (seconds) before agent proactively speaks
-    silence_prompt_timeout: float = 8.0
+    silence_prompt_timeout: float = 6.0
     # Min silence (seconds) before agent responds (avoids interruptions)
-    response_delay: float = 0.3
+    response_delay: float = 0.15
     # Max tokens for conversation context sent to LLM
-    max_context_tokens: int = 2048
+    max_context_tokens: int = 1024
     # Audio chunk size for speech processing (ms)
-    audio_chunk_ms: int = 80
+    audio_chunk_ms: int = 60
     # VAD (Voice Activity Detection) sensitivity 0.0–1.0
     vad_sensitivity: float = 0.6
     # Enable proactive agent (agent speaks without being asked)
-    proactive_mode: bool = False
+    proactive_mode: bool = True
     # System prompt for conversation mode
     system_prompt: str = (
         "You are SpeakAI, a real-time communication coach in a live video call. "

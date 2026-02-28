@@ -185,7 +185,59 @@ class AudioProcessor:
     def attach_agent(self, agent: Any) -> None:
         """Called when the Agent is created — gives access to agent + LLM."""
         self._agent = agent
+        self._active = True
         logger.info("AudioProcessor attached to agent")
+
+        # Start background WPM monitor
+        self._processing_task = asyncio.create_task(
+            self._audio_monitor(), name="audio-monitor"
+        )
+
+    async def handle_user_transcript(self, text: str) -> None:
+        """
+        Called when a user speech transcription event arrives from the SDK.
+        Updates WPM tracking, filler word counts, and transcript buffer.
+        """
+        if not text or not text.strip():
+            return
+
+        text = text.strip()
+        now = time.time()
+
+        # Count words
+        words = len(text.split())
+        self.total_words += words
+
+        # Track word timestamps for WPM calculation
+        self._analyzer._word_timestamps.extend([now] * words)
+
+        # Count filler words
+        fillers = self._analyzer.count_fillers(text)
+        self.total_fillers += fillers
+
+        # Update speaking state
+        self._analyzer._is_speaking = True
+        if self._analyzer._speaking_start is None:
+            self._analyzer._speaking_start = now
+
+        # Add to transcript
+        entry = TranscriptEntry(
+            speaker="user",
+            text=text,
+            timestamp=now,
+            confidence=1.0,
+            is_final=True,
+        )
+        self._full_transcript.append(entry)
+
+        # Update WPM immediately
+        self.current_wpm = self._analyzer.estimate_wpm()
+
+        logger.debug(
+            f"AudioProcessor: transcript +{words} words, "
+            f"+{fillers} fillers, WPM={self.current_wpm}, "
+            f"total_fillers={self.total_fillers}"
+        )
 
     async def process_audio(
         self,
@@ -193,35 +245,22 @@ class AudioProcessor:
         participant_id: Optional[str] = None,
     ) -> None:
         """
-        Called by the Agent when a participant's audio track appears.
-        The Vision Agent SDK handles audio routing — we receive callbacks.
-
-        For SDK-integrated mode: the Agent's Gemini Realtime plugin
-        already processes audio for understanding. We additionally
-        extract speech metrics and maintain a transcript.
+        Called when a participant's audio track appears.
+        In SDK-integrated mode, transcripts come via agent.subscribe() events
+        routed through handle_user_transcript(). This method just marks audio
+        as active and starts the WPM monitor if not already running.
         """
         self._active = True
         logger.info(
-            f"AudioProcessor: processing audio from "
+            f"AudioProcessor: audio track from "
             f"participant {participant_id or 'unknown'}"
         )
 
-        # The Agent's Gemini Realtime plugin handles audio transcription.
-        # We monitor the agent's transcript events if available.
-        if self._agent and hasattr(self._agent, "on"):
-            try:
-                # Subscribe to transcript events from the agent
-                self._agent.on("transcript", self._handle_agent_transcript)
-                self._agent.on("user_speech_started", self._handle_speech_start)
-                self._agent.on("user_speech_ended", self._handle_speech_end)
-                logger.info("AudioProcessor: subscribed to agent transcript events")
-            except Exception as e:
-                logger.debug(f"AudioProcessor: agent event subscription: {e}")
-
-        # Start a background poll for the agent's transcript state
-        self._processing_task = asyncio.create_task(
-            self._audio_monitor(), name="audio-monitor"
-        )
+        # Start WPM monitor if not already running
+        if self._processing_task is None or self._processing_task.done():
+            self._processing_task = asyncio.create_task(
+                self._audio_monitor(), name="audio-monitor"
+            )
 
     async def _audio_monitor(self) -> None:
         """
@@ -320,15 +359,6 @@ class AudioProcessor:
             try:
                 await self._processing_task
             except (asyncio.CancelledError, Exception):
-                pass
-
-        # Unsubscribe from agent events
-        if self._agent and hasattr(self._agent, "off"):
-            try:
-                self._agent.off("transcript", self._handle_agent_transcript)
-                self._agent.off("user_speech_started", self._handle_speech_start)
-                self._agent.off("user_speech_ended", self._handle_speech_end)
-            except Exception:
                 pass
 
         logger.info("AudioProcessor stopped")

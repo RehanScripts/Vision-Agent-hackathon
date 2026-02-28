@@ -85,11 +85,31 @@ export interface SystemStatus {
   audio_active: boolean;
   inference_latency_ms: number;
   frames_processed: number;
+  metrics_source: string;
   transcript_entries: number;
   chat_messages: number;
   conversation_turns: number;
   source: string;
+  /** Explicit session state: init | ready | active | degraded | failed */
+  session_state?: SessionStateValue;
+  /** Explicit operating mode: multimodal | audio_only | unavailable */
+  session_mode?: SessionModeValue;
+  /** Health check snapshot */
+  health?: { video: boolean; audio: boolean; model: boolean };
+  /** Latency trace */
+  latency?: Record<string, unknown>;
 }
+
+/** Session state values from the backend state machine */
+export type SessionStateValue =
+  | "init"
+  | "ready"
+  | "active"
+  | "degraded"
+  | "failed";
+
+/** Operating mode values from the backend policy layer */
+export type SessionModeValue = "multimodal" | "audio_only" | "unavailable";
 
 interface WebSocketMessage {
   type: string;
@@ -267,6 +287,30 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
               (message.payload ?? message.data) as unknown as SystemStatus
             );
             break;
+
+          case "state_transition": {
+            // Update system status with fresh state/mode from transition event
+            const transitionData = (message.payload ?? message.data) as Record<string, unknown>;
+            setSystemStatus((prev) => ({
+              ...(prev ?? {
+                sdk_active: false,
+                multimodal_active: false,
+                agent_joined: false,
+                audio_active: false,
+                inference_latency_ms: 0,
+                frames_processed: 0,
+                metrics_source: "none",
+                transcript_entries: 0,
+                chat_messages: 0,
+                conversation_turns: 0,
+                source: "sdk",
+              }),
+              session_state: transitionData.session_state as SessionStateValue,
+              session_mode: transitionData.session_mode as SessionModeValue,
+              health: transitionData.health as { video: boolean; audio: boolean; model: boolean },
+            }));
+            break;
+          }
 
           case "error":
             setLastError(message.message ?? "Unknown server error");

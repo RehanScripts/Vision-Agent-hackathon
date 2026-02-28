@@ -124,6 +124,9 @@ class SessionTelemetry:
     transcript_entries: int = 0
     chat_messages: int = 0
     conversation_turns: int = 0
+    # ── Production integrity fields ─────────────────────────────────────
+    session_state: str = "init"        # SessionState enum value
+    session_mode: str = "unavailable"  # SessionMode enum value
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

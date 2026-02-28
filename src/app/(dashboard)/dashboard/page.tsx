@@ -3,7 +3,6 @@
 import { motion } from "framer-motion";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import CameraFeed from "@/components/dashboard/CameraFeed";
 import StreamCallPanel from "@/components/dashboard/StreamCallPanel";
 import ChatPanel from "@/components/dashboard/ChatPanel";
 import MetricCard from "@/components/ui/MetricCard";
@@ -341,6 +340,40 @@ function DashboardPage() {
               </span>
             </div>
           )}
+          {/* Explicit mode indicator (requirement #5) */}
+          {isSessionActive && sessionStatus !== "demo" && systemStatus?.session_mode && (
+            <span
+              className={`text-[10px] font-semibold uppercase tracking-widest px-2 py-0.5 rounded-full border ${
+                systemStatus.session_mode === "multimodal"
+                  ? "text-[#22C55E] border-[#22C55E]/30 bg-[#22C55E]/10"
+                  : systemStatus.session_mode === "audio_only"
+                  ? "text-[#F59E0B] border-[#F59E0B]/30 bg-[#F59E0B]/10"
+                  : "text-white/30 border-white/10 bg-white/5"
+              }`}
+            >
+              {systemStatus.session_mode === "multimodal"
+                ? "Multimodal"
+                : systemStatus.session_mode === "audio_only"
+                ? "Audio Only"
+                : "Unavailable"}
+            </span>
+          )}
+          {/* Session state badge */}
+          {isSessionActive && sessionStatus !== "demo" && systemStatus?.session_state && systemStatus.session_state !== "active" && (
+            <span
+              className={`text-[10px] font-semibold uppercase tracking-widest px-2 py-0.5 rounded-full border ${
+                systemStatus.session_state === "degraded"
+                  ? "text-[#F59E0B] border-[#F59E0B]/30 bg-[#F59E0B]/10"
+                  : systemStatus.session_state === "failed"
+                  ? "text-[#EF4444] border-[#EF4444]/30 bg-[#EF4444]/10"
+                  : systemStatus.session_state === "ready"
+                  ? "text-[#4F8CFF] border-[#4F8CFF]/30 bg-[#4F8CFF]/10"
+                  : "text-white/30 border-white/10 bg-white/5"
+              }`}
+            >
+              {systemStatus.session_state}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -378,27 +411,29 @@ function DashboardPage() {
         </motion.p>
       )}
 
-      {sessionStatus === "active" && systemStatus?.frames_processed === 0 && (
+      {sessionStatus === "active" && systemStatus?.session_mode === "audio_only" && (
         <motion.p variants={fadeUp} className="text-xs text-[#F59E0B]/80 -mt-2">
-          Live session started but no video frames received yet. Keep Stream call camera on and published.
+          Audio-only mode — visual metrics (eye contact, posture) unavailable. WPM and filler words are tracking from speech.
+        </motion.p>
+      )}
+
+      {sessionStatus === "active" && systemStatus?.session_state === "degraded" && systemStatus?.session_mode !== "audio_only" && (
+        <motion.p variants={fadeUp} className="text-xs text-[#F59E0B]/80 -mt-2">
+          Session degraded — some capabilities are limited. Check camera and network.
         </motion.p>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-        {/* Camera Feed - Left Column */}
+        {/* Video Feed - Left Column */}
         <motion.div variants={fadeUp} className="lg:col-span-3">
-          <CameraFeed
+          <StreamCallPanel
             connectionStatus={connectionStatus}
             sessionStatus={sessionStatus}
             streaming={isSessionActive}
+            onReadyChange={setStreamReady}
+            onMediaReadyChange={setStreamMediaReady}
+            onCallIdChange={setStreamCallId}
           />
-          <div className="mt-4">
-            <StreamCallPanel
-              onReadyChange={setStreamReady}
-              onMediaReadyChange={setStreamMediaReady}
-              onCallIdChange={setStreamCallId}
-            />
-          </div>
           {/* AI Communication Panel */}
           <motion.div variants={fadeUp} className="mt-4">
             <ChatPanel

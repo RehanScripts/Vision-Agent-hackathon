@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections import deque
@@ -39,6 +40,7 @@ from ..core.models import (
     CoachingFeedback,
 )
 from ..core.config import conversation_cfg
+from ..core.health import SessionPolicy, FRESHNESS_MAX_AGE_S
 
 logger = logging.getLogger("speakai.conversation")
 
@@ -83,6 +85,11 @@ class ConversationManager:
         self._last_user_speech_end: float = 0.0
         self._last_agent_response: float = 0.0
         self._pending_response = False
+        self._pending_response_task: Optional[asyncio.Task] = None
+
+        # Voice transcript batching (merge fragmented final chunks)
+        self._pending_voice_fragments: List[str] = []
+        self._pending_voice_flush_task: Optional[asyncio.Task] = None
 
         # Proactive mode
         self._last_proactive_check: float = 0.0
@@ -94,6 +101,9 @@ class ConversationManager:
 
         # Visual context (updated by processor)
         self._latest_metrics: Optional[SpeakingMetrics] = None
+
+        # Session mode (set by service layer via set_session_mode)
+        self._session_mode: str = "unavailable"
 
         # Add system message
         system_msg = ChatMessage(
@@ -127,9 +137,16 @@ class ConversationManager:
         """Update the latest visual metrics for context."""
         self._latest_metrics = metrics
 
+    def set_session_mode(self, mode: str) -> None:
+        """Set the current session mode (from policy layer)."""
+        if mode != self._session_mode:
+            logger.info(f"[{self.session_id}] Conversation mode: {self._session_mode} → {mode}")
+            self._session_mode = mode
+
     async def start(self) -> None:
         """Start the conversation manager."""
         self._active = True
+        self._last_agent_response = time.time()  # prevent immediate proactive
 
         # Start proactive monitoring if enabled
         if conversation_cfg.proactive_mode:
@@ -137,11 +154,65 @@ class ConversationManager:
                 self._proactive_worker(), name=f"proactive-{self.session_id}"
             )
 
+        # Send welcome message after a short delay so frontend is ready
+        asyncio.create_task(
+            self._send_welcome(), name=f"welcome-{self.session_id}"
+        )
+
         logger.info(f"[{self.session_id}] ConversationManager started")
+
+    async def _send_welcome(self) -> None:
+        """Send an initial greeting when the agent joins."""
+        logger.info(f"[{self.session_id}] 🎤 Welcome task started, waiting 3s...")
+        await asyncio.sleep(3.0)  # Let everything initialize
+        if not self._active:
+            logger.warning(f"[{self.session_id}] Welcome aborted — session no longer active")
+            return
+
+        welcome = (
+            "Hi! I'm your AI speaking coach. Start speaking and I'll give you "
+            "real-time feedback on pace, filler words, and more. Ask me anything!"
+        )
+        msg = ChatMessage(
+            id=uuid.uuid4().hex[:8],
+            role="assistant",
+            content=welcome,
+            source="system",
+        )
+        self._messages.append(msg)
+        self._state.last_agent_response = welcome
+        self._last_agent_response = time.time()
+
+        if self._on_chat_message:
+            cb = self._on_chat_message(msg)
+            if asyncio.iscoroutine(cb):
+                await cb
+
+        # Also speak the welcome via TTS
+        if self._on_agent_speech:
+            cb = self._on_agent_speech(welcome)
+            if asyncio.iscoroutine(cb):
+                await cb
+
+        logger.info(f"[{self.session_id}] Welcome message sent")
 
     async def stop(self) -> Dict[str, Any]:
         """Stop and return conversation summary."""
         self._active = False
+
+        if self._pending_voice_flush_task and not self._pending_voice_flush_task.done():
+            self._pending_voice_flush_task.cancel()
+            try:
+                await self._pending_voice_flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if self._pending_response_task and not self._pending_response_task.done():
+            self._pending_response_task.cancel()
+            try:
+                await self._pending_response_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         if self._proactive_task and not self._proactive_task.done():
             self._proactive_task.cancel()
@@ -198,27 +269,15 @@ class ConversationManager:
             self._state.is_user_speaking = not entry.is_final
 
             if entry.is_final and entry.text.strip():
-                msg = ChatMessage(
-                    id=uuid.uuid4().hex[:8],
-                    role="user",
-                    content=entry.text.strip(),
-                    source="voice",
+                self._pending_voice_fragments.append(entry.text.strip())
+
+                if self._pending_voice_flush_task and not self._pending_voice_flush_task.done():
+                    self._pending_voice_flush_task.cancel()
+
+                self._pending_voice_flush_task = asyncio.create_task(
+                    self._flush_voice_utterance(),
+                    name=f"flush-voice-{self.session_id}",
                 )
-                self._messages.append(msg)
-                self._state.last_user_speech = entry.text.strip()
-                self._state.turn_count += 1
-
-                if self._on_chat_message:
-                    cb = self._on_chat_message(msg)
-                    if asyncio.iscoroutine(cb):
-                        await cb
-
-                # Mark speech end for turn-taking
-                self._last_user_speech_end = time.time()
-                self._pending_response = True
-
-                # Wait for response delay, then respond
-                asyncio.create_task(self._delayed_response())
 
         elif entry.speaker == "agent":
             # Agent's own speech transcript
@@ -237,12 +296,64 @@ class ConversationManager:
             self._pending_response = False
             await self._generate_response(trigger="voice_input")
 
+    async def _flush_voice_utterance(self) -> None:
+        """Debounce fragmented voice transcript chunks into a single utterance."""
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            return
+
+        if not self._pending_voice_fragments:
+            return
+
+        merged_text = self._normalize_voice_text(" ".join(self._pending_voice_fragments))
+        self._pending_voice_fragments.clear()
+
+        if not merged_text:
+            return
+
+        msg = ChatMessage(
+            id=uuid.uuid4().hex[:8],
+            role="user",
+            content=merged_text,
+            source="voice",
+        )
+        self._messages.append(msg)
+        self._state.last_user_speech = merged_text
+        self._state.turn_count += 1
+
+        if self._on_chat_message:
+            cb = self._on_chat_message(msg)
+            if asyncio.iscoroutine(cb):
+                await cb
+
+        self._last_user_speech_end = time.time()
+        self._pending_response = True
+
+        if self._pending_response_task and not self._pending_response_task.done():
+            self._pending_response_task.cancel()
+
+        self._pending_response_task = asyncio.create_task(
+            self._delayed_response(),
+            name=f"delay-response-{self.session_id}",
+        )
+
+    @staticmethod
+    def _normalize_voice_text(text: str) -> str:
+        """Normalize spacing and punctuation for merged transcript text."""
+        cleaned = " ".join(text.split())
+        cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+        return cleaned.strip()
+
     # ── Response generation ─────────────────────────────────────────────
 
     async def _generate_response(self, trigger: str = "auto") -> None:
         """
         Generate an AI response using the Agent's LLM.
         Combines conversation context + visual metrics.
+
+        FRESHNESS GATE: Visual-dependent responses are blocked unless
+        metrics are fresh and from a real visual source.
         """
         now = time.time()
 
@@ -304,66 +415,170 @@ class ConversationManager:
 
     async def _call_llm(self, trigger: str) -> Optional[str]:
         """
-        Build the prompt with full context and call the LLM.
-        Uses Agent.llm if available, otherwise returns None.
+        Build context-aware response text for the agent to speak via TTS.
+
+        Priority:
+          1. Visual guardrails (hard-coded for honesty about capabilities)
+          2. Agent LLM (agent.llm.simple_response) for rich, dynamic responses
+          3. Deterministic fallback if LLM unavailable or times out
+
+        FRESHNESS + MODE GATE:
+        - Visual claims require fresh metrics from a real visual source
+          AND session_mode == "multimodal".
+        - In audio_only mode, only audio-derived coaching is generated.
         """
-        if self._agent is None or not hasattr(self._agent, "llm"):
-            return self._fallback_response(trigger)
+        latest_user_text = (self._state.last_user_speech or "").strip()
+        has_live_visual = self._has_live_visual_context()
 
-        # Build context
-        context_parts = []
+        # In audio-only mode, never claim visual capability
+        if self._session_mode == "audio_only":
+            has_live_visual = False
 
-        # Add visual context if available
-        if self._latest_metrics:
+        # Hard guardrails for visual honesty and unsupported tasks
+        if self._is_visual_question(latest_user_text):
+            guarded = self._visual_capability_response(latest_user_text, has_live_visual)
+            if guarded:
+                return guarded
+
+        # Try the agent's LLM for a dynamic response
+        if self._agent and hasattr(self._agent, "llm"):
+            try:
+                prompt = self._build_llm_prompt(trigger, latest_user_text, has_live_visual)
+                response = await asyncio.wait_for(
+                    self._agent.llm.simple_response(prompt),
+                    timeout=conversation_cfg.llm_timeout if hasattr(conversation_cfg, 'llm_timeout') else 5.0,
+                )
+                text = getattr(response, "text", str(response)).strip()
+                if text and len(text) > 5:
+                    return text
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.session_id}] LLM response timed out — using fallback")
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] LLM call failed: {e} — using fallback")
+
+        return self._fallback_response(trigger)
+
+    def _build_llm_prompt(self, trigger: str, user_text: str, has_live_visual: bool) -> str:
+        """Build a context-aware prompt for the agent's LLM."""
+        parts: list[str] = []
+
+        # Context: metrics
+        if self._latest_metrics and self._latest_metrics.timestamp > 0:
             m = self._latest_metrics
-            context_parts.append(
-                f"[Visual observation] Eye contact: {m.eye_contact:.0f}%, "
-                f"head stability: {m.head_stability:.0f}%, "
-                f"posture: {m.posture_score:.0f}%, "
-                f"engagement: {m.facial_engagement:.0f}%, "
-                f"WPM: {m.words_per_minute}"
-            )
+            if has_live_visual:
+                parts.append(
+                    f"Speaker metrics: eye contact {m.eye_contact:.0f}%, "
+                    f"posture {m.posture_score:.0f}%, "
+                    f"head stability {m.head_stability:.0f}%, "
+                    f"engagement {m.facial_engagement:.0f}%, "
+                    f"WPM {m.words_per_minute:.0f}, "
+                    f"filler words {m.filler_words}."
+                )
+            else:
+                parts.append(
+                    f"Audio metrics: WPM {m.words_per_minute:.0f}, "
+                    f"filler words {m.filler_words}. "
+                    "No video feed available."
+                )
 
-        # Build conversation prompt
-        recent_messages = list(self._messages)[-6:]  # Last 6 messages for context
-        conversation_text = "\n".join(
-            f"{msg.role}: {msg.content}"
-            for msg in recent_messages
-            if msg.role != "system"
+        if trigger == "proactive":
+            parts.append(
+                "The speaker has been quiet. Give a brief, encouraging coaching tip "
+                "based on their current metrics. Keep it under 2 sentences."
+            )
+        elif trigger == "text_input" and user_text:
+            parts.append(f"The user asked: \"{user_text}\"")
+            parts.append("Respond helpfully as a speaking coach. Keep it concise (1-3 sentences).")
+        elif trigger == "voice_input" and user_text:
+            parts.append(f"The user said: \"{user_text}\"")
+            parts.append("Respond as a speaking coach. Be brief and supportive (1-2 sentences).")
+        else:
+            parts.append("Give a brief coaching observation. Keep it under 2 sentences.")
+
+        return "\n".join(parts)
+
+    def _has_live_visual_context(self) -> bool:
+        """
+        True when we have fresh, real visual metrics from video frames.
+        Uses the same freshness window as the policy layer.
+        """
+        if not self._latest_metrics:
+            return False
+
+        m = self._latest_metrics
+        if m.timestamp <= 0:
+            return False
+
+        # Treat stale metrics as no live visual signal.
+        if (time.time() - m.timestamp) > FRESHNESS_MAX_AGE_S:
+            return False
+
+        # Simulated/estimated/audio-only values should not be used to claim real visibility.
+        if (m.source or "").lower() in ("simulated", "live_estimation", "audio_only", "no_mediapipe"):
+            return False
+
+        # Session mode must be multimodal for visual claims
+        if self._session_mode != "multimodal":
+            return False
+
+        return True
+
+    @staticmethod
+    def _is_visual_question(text: str) -> bool:
+        t = text.lower()
+        visual_keywords = (
+            "see me", "visible", "can you see", "look", "expression", "face", "camera",
+            "finger", "fingers", "fingure", "gesture", "hand"
+        )
+        return any(keyword in t for keyword in visual_keywords)
+
+    @staticmethod
+    def _is_finger_count_question(text: str) -> bool:
+        t = text.lower()
+        return (
+            "finger" in t
+            or "fingers" in t
+            or "fingure" in t
+            or "how many" in t and "hand" in t
         )
 
-        prompt = (
-            f"{conversation_cfg.system_prompt}\n\n"
-            f"{''.join(context_parts)}\n\n"
-            f"Recent conversation:\n{conversation_text}\n\n"
-            "Respond naturally and directly to the latest user message. "
-            "If it's a question, answer it first. Keep it concise (≤35 words)."
-        )
-
-        try:
-            timeout = 4.5 if trigger in ("text_input", "voice_input") else 2.5
-            response = await asyncio.wait_for(
-                self._agent.llm.simple_response(prompt),
-                timeout=timeout,
+    def _visual_capability_response(self, user_text: str, has_live_visual: bool) -> Optional[str]:
+        """Deterministic, honest responses for visibility/capability questions."""
+        if not has_live_visual:
+            return (
+                "I don't have a reliable live video feed yet. "
+                "Make sure your camera is on and publishing in the Stream call. "
+                "I can still coach you on speech pace, clarity, and filler words!"
             )
-            text = getattr(response, "text", str(response))
-            if text and len(text.strip()) > 2:
-                return text
 
-            logger.warning(f"[{self.session_id}] LLM returned empty response, using fallback")
-            return self._fallback_response(trigger)
-        except asyncio.TimeoutError:
-            logger.warning(f"[{self.session_id}] LLM response timed out")
-            return self._fallback_response(trigger)
-        except Exception as e:
-            logger.warning(f"[{self.session_id}] LLM call failed: {e}")
-            return self._fallback_response(trigger)
+        if self._is_finger_count_question(user_text):
+            return (
+                "I can assess eye contact, posture, and overall facial engagement, "
+                "but I can’t reliably count fingers yet."
+            )
+
+        if "expression" in user_text.lower() and self._latest_metrics:
+            engagement = self._latest_metrics.facial_engagement
+            if engagement >= 70:
+                return "Your expressions look reasonably engaged right now."
+            return "Your expressions look a bit flat right now—try adding more facial emphasis."
+
+        return None
 
     def _fallback_response(self, trigger: str) -> Optional[str]:
         """Generate a simple fallback response when LLM is unavailable."""
-        if trigger == "proactive" and self._latest_metrics:
-            if not self._has_actionable_metrics():
-                return None
+        if trigger == "proactive":
+            # Audio-only coaching when no visual metrics available
+            if not self._latest_metrics or not self._has_visual_metrics():
+                tips = [
+                    "Remember to maintain steady eye contact with your camera.",
+                    "Keep your shoulders back and sit up straight for better presence.",
+                    "Try to vary your vocal tone — it keeps listeners engaged.",
+                    "Pause briefly between key points for emphasis.",
+                    "You're doing great! Keep going with confidence.",
+                ]
+                import random
+                return random.choice(tips)
 
             m = self._latest_metrics
             if m.eye_contact < 50:
@@ -376,18 +591,31 @@ class ConversationManager:
 
         if trigger == "text_input":
             user_text = (self._state.last_user_speech or "").lower()
-            if "eye" in user_text:
-                return "Focus on looking at the camera lens for 2–3 seconds at a time."
-            if "posture" in user_text:
+            if "eye" in user_text or "contact" in user_text:
+                return "Focus on looking at the camera lens for 2–3 seconds at a time. It builds trust with your audience."
+            if "posture" in user_text or "sit" in user_text or "stand" in user_text:
                 return "Keep shoulders relaxed, chest open, and sit upright for stronger presence."
-            if "pace" in user_text or "speed" in user_text or "wpm" in user_text:
-                return "Aim for a steady 120–150 WPM and pause briefly after key points."
-            return "I can help with eye contact, posture, pace, or confidence. Ask one specific question."
+            if "pace" in user_text or "speed" in user_text or "wpm" in user_text or "fast" in user_text or "slow" in user_text:
+                return "Aim for a steady 120–150 WPM. Pause briefly after key points for emphasis."
+            if "filler" in user_text or "um" in user_text or "uh" in user_text or "like" in user_text:
+                return "Replace filler words with brief pauses. It sounds more confident and polished."
+            if "nervous" in user_text or "anxiety" in user_text or "confident" in user_text:
+                return "Take a deep breath before speaking. Open posture and steady eye contact project confidence."
+            if "hello" in user_text or "hi" in user_text or "hey" in user_text:
+                return "Hi there! I'm your speaking coach. Try practicing a short pitch and I'll give feedback."
+            if "help" in user_text or "what can" in user_text or "how" in user_text:
+                return "I coach on eye contact, posture, pace, and filler words. Start speaking or ask me a specific question!"
+            if "tip" in user_text or "advice" in user_text or "suggest" in user_text:
+                return "Here's a quick tip: vary your vocal tone and pause between key ideas. It keeps listeners engaged."
+            return "Great question! I can help with eye contact, posture, pace, filler words, and confidence. What would you like to work on?"
+
+        if trigger == "voice_input":
+            return "I heard you! Try to speak clearly and at a steady pace."
 
         return None
 
     def _has_actionable_metrics(self) -> bool:
-        """True only when we have meaningful (non-default) visual metrics."""
+        """True when we have any metrics data (visual or audio) to act on."""
         if not self._latest_metrics:
             return False
 
@@ -395,6 +623,18 @@ class ConversationManager:
         if m.timestamp <= 0:
             return False
 
+        # Active session with any data means we can coach
+        return True
+
+    def _has_visual_metrics(self) -> bool:
+        """True only when we have real non-zero visual metrics from MediaPipe."""
+        if not self._latest_metrics:
+            return False
+        m = self._latest_metrics
+        if m.timestamp <= 0:
+            return False
+        if (m.source or "").lower() in ("simulated", "live_estimation", "audio_only", "no_mediapipe"):
+            return False
         signal = m.eye_contact + m.posture_score + m.head_stability + m.facial_engagement
         return signal > 5
 
@@ -418,8 +658,8 @@ class ConversationManager:
 
     async def _proactive_worker(self) -> None:
         """
-        Periodically checks if the agent should proactively comment
-        based on visual observations during silence.
+        Periodically checks if the agent should proactively comment.
+        Works in both visual and audio-only modes.
         """
         while self._active:
             try:
@@ -432,10 +672,9 @@ class ConversationManager:
                     self._last_user_speech_end, self._last_agent_response
                 )
 
-                # Only speak proactively if there's been silence
+                # Speak proactively if there's been enough silence
                 if (
                     silence_duration >= conversation_cfg.silence_prompt_timeout
-                    and self._has_actionable_metrics()
                     and not self._state.is_user_speaking
                     and not self._state.is_agent_speaking
                 ):

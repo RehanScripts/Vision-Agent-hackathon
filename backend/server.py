@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SpeakAI — Real-Time AI Speaking Coach",
-    version="4.0.0",
+    version="4.1.0",
     description=(
         "AI agent that joins Stream Video calls as a real participant, "
         "analyses the speaker's video+audio via Vision Agents SDK, and "
@@ -130,7 +130,7 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "sdk_keys_configured": sdk_cfg.has_all_keys,
         "active_sessions": registry.active_count,
         "active_demos": len(_demo_services),
@@ -283,7 +283,8 @@ async def websocket_metrics(ws: WebSocket):
                         "data": {
                             "session_id": session_id,
                             "call_id": call_id,
-                            "mode": "live",
+                            "session_state": "init",
+                            "session_mode": "unavailable",
                         },
                     })
 
