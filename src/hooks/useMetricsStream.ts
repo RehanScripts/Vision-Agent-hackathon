@@ -1,9 +1,12 @@
 /**
- * SpeakAI — WebSocket Hook for Real-Time Metrics
+ * SpeakAI — WebSocket Hook for Real-Time Metrics & Communication
  *
  * Connects to the Python backend WebSocket and provides:
  * - Live metrics stream (eye contact, posture, etc.)
  * - Coaching feedback messages
+ * - Chat messages (bidirectional AI ↔ user conversation)
+ * - Live transcript (speech-to-text from audio)
+ * - Conversation state (who's speaking, turn count)
  * - Session control (start/stop/demo)
  * - Connection state management
  * - Auto-reconnect with exponential backoff
@@ -38,6 +41,33 @@ export interface CoachingFeedback {
   timestamp: number;
 }
 
+/** Chat message in the bidirectional conversation */
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp: number;
+  source?: string;
+}
+
+/** Speech-to-text transcript entry */
+export interface TranscriptEntry {
+  speaker: string;
+  text: string;
+  timestamp: number;
+  confidence: number;
+  is_final: boolean;
+}
+
+/** Conversation state */
+export interface ConversationState {
+  is_user_speaking: boolean;
+  is_agent_speaking: boolean;
+  turn_count: number;
+  last_user_speech: string;
+  last_agent_response: string;
+}
+
 export type ConnectionStatus =
   | "disconnected"
   | "connecting"
@@ -45,24 +75,26 @@ export type ConnectionStatus =
   | "error"
   | "reconnecting";
 
-export type SessionStatus = "idle" | "active" | "demo";
+export type SessionStatus = "idle" | "starting" | "active" | "demo";
 
 /** Debug telemetry sent by the backend every ~5 s */
 export interface SystemStatus {
   sdk_active: boolean;
   multimodal_active: boolean;
   agent_joined: boolean;
+  audio_active: boolean;
   inference_latency_ms: number;
   frames_processed: number;
+  transcript_entries: number;
+  chat_messages: number;
+  conversation_turns: number;
   source: string;
 }
 
 interface WebSocketMessage {
   type: string;
-  /** Backend may send `data` or `payload` depending on event type */
   data?: Record<string, unknown>;
   payload?: Record<string, unknown>;
-  /** Error messages include a `message` field */
   message?: string;
 }
 
@@ -105,16 +137,29 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     useState<ConnectionStatus>("disconnected");
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
+
+  // Communication state
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [conversationState, setConversationState] =
+    useState<ConversationState | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pingInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastMetricsTsRef = useRef<number>(0);
 
   // -- Connect ---------------------------------------------------------------
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    if (
+      wsRef.current?.readyState === WebSocket.OPEN ||
+      wsRef.current?.readyState === WebSocket.CONNECTING
+    ) {
+      return;
+    }
 
     setConnectionStatus("connecting");
     const ws = new WebSocket(url);
@@ -122,6 +167,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
 
     ws.onopen = () => {
       setConnectionStatus("connected");
+      setLastError(null);
       reconnectAttempts.current = 0;
       console.log("✅ Metrics WebSocket connected");
 
@@ -140,9 +186,18 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
         switch (message.type) {
           case "metrics":
           case "metrics_update":
-            setMetrics(
-              (message.payload ?? message.data) as unknown as SpeakingMetrics
-            );
+            {
+              const nextMetrics =
+                (message.payload ?? message.data) as unknown as SpeakingMetrics;
+              const nextTs = typeof nextMetrics.timestamp === "number" ? nextMetrics.timestamp : 0;
+              if (nextTs > 0 && nextTs === lastMetricsTsRef.current) {
+                break;
+              }
+              if (nextTs > 0) {
+                lastMetricsTsRef.current = nextTs;
+              }
+              setMetrics(nextMetrics);
+            }
             break;
 
           case "feedback":
@@ -154,8 +209,42 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
             break;
           }
 
+          // ── Communication events ──────────────────────────────
+          case "chat": {
+            const chatMsg = (message.payload ??
+              message.data) as unknown as ChatMessage;
+            setChatMessages((prev) => [...prev, chatMsg].slice(-100));
+            break;
+          }
+
+          case "transcript": {
+            const entry = (message.payload ??
+              message.data) as unknown as TranscriptEntry;
+            if (entry.is_final) {
+              setTranscript((prev) => [...prev, entry].slice(-200));
+            }
+            break;
+          }
+
+          case "conversation_state": {
+            const state = (message.payload ??
+              message.data) as unknown as ConversationState;
+            setConversationState(state);
+            break;
+          }
+
+          // ── Session lifecycle ─────────────────────────────────
           case "session_started":
             setSessionStatus("active");
+            setLastError(null);
+            setChatMessages([]);
+            setTranscript([]);
+            setConversationState(null);
+            break;
+
+          case "session_starting":
+            setSessionStatus("starting");
+            setLastError(null);
             break;
 
           case "session_stopped":
@@ -164,6 +253,9 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
 
           case "demo_started":
             setSessionStatus("demo");
+            setLastError(null);
+            setChatMessages([]);
+            setTranscript([]);
             break;
 
           case "pong":
@@ -177,6 +269,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
             break;
 
           case "error":
+            setLastError(message.message ?? "Unknown server error");
             console.warn("⚠️ Server error:", message.message ?? message.data);
             break;
 
@@ -239,6 +332,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "stop_session" }));
       setSessionStatus("idle");
+      lastMetricsTsRef.current = 0;
     }
   }, []);
 
@@ -248,11 +342,14 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     }
   }, []);
 
-  // -- Send Frame (deprecated — agent gets frames from Stream call) ----------
+  // -- Chat: send a text message to the AI agent ----------------------------
 
-  const sendFrame = useCallback((_base64Jpeg: string) => {
-    // No-op: the AI agent receives video directly from the Stream Video call.
-    // This method is kept for backward-compatibility with CameraFeed.
+  const sendMessage = useCallback((text: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN && text.trim()) {
+      wsRef.current.send(
+        JSON.stringify({ type: "send_message", text: text.trim() })
+      );
+    }
   }, []);
 
   // -- Dismiss Feedback ------------------------------------------------------
@@ -281,6 +378,12 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     connectionStatus,
     sessionStatus,
     systemStatus,
+    lastError,
+
+    // Communication state
+    chatMessages,
+    transcript,
+    conversationState,
 
     // Actions
     connect,
@@ -288,7 +391,7 @@ export function useMetricsStream(options: UseMetricsStreamOptions = {}) {
     startSession,
     stopSession,
     startDemo,
-    sendFrame,
+    sendMessage,
     dismissFeedback,
   };
 }

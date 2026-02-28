@@ -4,7 +4,8 @@ import { motion } from "framer-motion";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import CameraFeed from "@/components/dashboard/CameraFeed";
-import FeedbackPanel from "@/components/dashboard/FeedbackPanel";
+import StreamCallPanel from "@/components/dashboard/StreamCallPanel";
+import ChatPanel from "@/components/dashboard/ChatPanel";
 import MetricCard from "@/components/ui/MetricCard";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
@@ -33,9 +34,6 @@ function SemiCircleGauge({
   color: string;
 }) {
   const percentage = Math.min(value / max, 1);
-  const radius = 50;
-  const circumference = Math.PI * radius;
-  const strokeDashoffset = circumference * (1 - percentage);
 
   return (
     <div className="relative w-full flex justify-center">
@@ -177,18 +175,25 @@ function DashboardPage() {
   const searchParams = useSearchParams();
   const scenarioType = searchParams.get("type") || "Free Practice";
 
+  const [streamCallId, setStreamCallId] = useState("speakai-live");
+  const [streamReady, setStreamReady] = useState(false);
+  const [streamMediaReady, setStreamMediaReady] = useState(false);
+
   const {
     metrics,
-    feedback,
     connectionStatus,
     sessionStatus,
+    systemStatus,
+    lastError,
     connect,
     startSession,
     stopSession,
     startDemo,
-    sendFrame,
-    dismissFeedback,
-  } = useMetricsStream({ url: "ws://localhost:8080/ws/metrics" });
+    chatMessages,
+    transcript,
+    conversationState,
+    sendMessage,
+  } = useMetricsStream({ url: "ws://localhost:8080/ws/metrics", autoConnect: false });
 
   // Auto-connect on mount
   useEffect(() => {
@@ -281,24 +286,24 @@ function DashboardPage() {
     stopSession();
   }, [metrics, sessionLabel, stopSession]);
 
-  const handleFrame = useCallback(
-    (base64Jpeg: string) => {
-      sendFrame(base64Jpeg);
-    },
-    [sendFrame]
-  );
+
 
   // Auto-start demo if query param says so
   useEffect(() => {
     if (searchParams.get("autostart") === "demo" && connectionStatus === "connected" && sessionStatus === "idle") {
       startDemo();
     }
-    if (searchParams.get("autostart") === "live" && connectionStatus === "connected" && sessionStatus === "idle") {
-      startSession();
+    if (
+      searchParams.get("autostart") === "live" &&
+      connectionStatus === "connected" &&
+      sessionStatus === "idle" &&
+      streamReady
+    ) {
+      startSession(streamCallId);
     }
     // Only run once when connected
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionStatus]);
+  }, [connectionStatus, streamReady, streamCallId]);
 
   const isSessionActive = sessionStatus !== "idle";
 
@@ -342,8 +347,8 @@ function DashboardPage() {
           {!isSessionActive ? (
             <>
               <button
-                onClick={() => startSession()}
-                disabled={connectionStatus !== "connected"}
+                onClick={() => startSession(streamCallId)}
+                disabled={connectionStatus !== "connected" || !streamReady || !streamMediaReady}
                 className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-[#4F8CFF]/15 text-[#4F8CFF] border border-[#4F8CFF]/20 hover:bg-[#4F8CFF]/25 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
               >
                 <Play className="w-3.5 h-3.5" /> Start Session
@@ -367,15 +372,43 @@ function DashboardPage() {
         </div>
       </motion.div>
 
+      {lastError && (
+        <motion.p variants={fadeUp} className="text-xs text-[#EF4444]/80 -mt-2">
+          {lastError}
+        </motion.p>
+      )}
+
+      {sessionStatus === "active" && systemStatus?.frames_processed === 0 && (
+        <motion.p variants={fadeUp} className="text-xs text-[#F59E0B]/80 -mt-2">
+          Live session started but no video frames received yet. Keep Stream call camera on and published.
+        </motion.p>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         {/* Camera Feed - Left Column */}
         <motion.div variants={fadeUp} className="lg:col-span-3">
           <CameraFeed
             connectionStatus={connectionStatus}
             sessionStatus={sessionStatus}
-            onFrame={handleFrame}
             streaming={isSessionActive}
           />
+          <div className="mt-4">
+            <StreamCallPanel
+              onReadyChange={setStreamReady}
+              onMediaReadyChange={setStreamMediaReady}
+              onCallIdChange={setStreamCallId}
+            />
+          </div>
+          {/* AI Communication Panel */}
+          <motion.div variants={fadeUp} className="mt-4">
+            <ChatPanel
+              messages={chatMessages}
+              transcript={transcript}
+              conversationState={conversationState}
+              onSendMessage={sendMessage}
+              sessionActive={isSessionActive}
+            />
+          </motion.div>
         </motion.div>
 
         {/* Metrics - Right Column */}
@@ -454,12 +487,13 @@ function DashboardPage() {
               {sessionStatus === "idle" ? "Standby" : `${sessionStatus} session`}
             </span>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-6">
             {[
               { label: "Head Stability", value: `${Math.round(metrics.head_stability)}%`, sub: metrics.head_stability >= 70 ? "Steady" : "Unstable" },
               { label: "Engagement", value: `${Math.round(metrics.facial_engagement)}%`, sub: metrics.facial_engagement >= 70 ? "Expressive" : "Flat" },
               { label: "Attention", value: `${Math.round(metrics.attention_intensity)}%`, sub: metrics.attention_intensity >= 70 ? "Focused" : "Distracted" },
               { label: "Overall", value: `${Math.round((metrics.eye_contact + metrics.posture_score + metrics.head_stability + metrics.facial_engagement) / 4)}%`, sub: "Composite" },
+              { label: "Conversation", value: `${conversationState?.turn_count ?? 0}`, sub: conversationState?.is_agent_speaking ? "AI Speaking" : conversationState?.is_user_speaking ? "User Speaking" : `${chatMessages.length} msgs` },
             ].map((stat, i) => (
               <motion.div
                 key={stat.label}
@@ -475,9 +509,6 @@ function DashboardPage() {
           </div>
         </GlassCard>
       </motion.div>
-
-      {/* Live Feedback Panel */}
-      <FeedbackPanel liveFeedback={feedback} onDismiss={dismissFeedback} />
     </motion.div>
   );
 }

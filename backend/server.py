@@ -25,11 +25,15 @@ Client → Server messages:
   { type: "start_session", call_id: "..." }  → join a Stream call
   { type: "start_demo" }                     → simulated metrics
   { type: "stop_session" }                   → stop current service
+  { type: "send_message", text: "..." }      → send chat to AI agent
   { type: "ping" }                           → keepalive
 
 Server → Client messages:
   { type: "metrics", data: {...} }           → per-frame metrics
   { type: "feedback", data: {...} }          → coaching feedback
+  { type: "chat", data: {...} }              → conversation message
+  { type: "transcript", data: {...} }        → speech transcript entry
+  { type: "conversation_state", data: {...} }→ conversation state
   { type: "system_status", payload: {...} }  → debug telemetry
   { type: "session_started", data: {...} }   → ack
   { type: "session_stopped", data: {...} }   → ack + summary
@@ -40,8 +44,10 @@ Server → Client messages:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict
@@ -49,9 +55,12 @@ from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import server_cfg, sdk_cfg
-from .ai_service import AIService, ServiceRegistry
-from .demo_service import DemoService
+from .core.config import server_cfg, sdk_cfg
+from .services.ai_service import AIService
+from .services.registry import ServiceRegistry
+from .services.demo_service import DemoService
+
+import jwt
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -128,6 +137,26 @@ async def health():
     }
 
 
+@app.get("/token")
+async def token(user_id: str):
+    if not sdk_cfg.stream_api_key or not sdk_cfg.stream_api_secret:
+        return {"error": "Stream API keys not configured"}
+
+    now = int(time.time())
+    payload = {
+        "user_id": user_id,
+        "iat": now,
+        "exp": now + 3600,
+    }
+    stream_token = jwt.encode(payload, sdk_cfg.stream_api_secret, algorithm="HS256")
+
+    return {
+        "api_key": sdk_cfg.stream_api_key,
+        "token": stream_token,
+        "user_id": user_id,
+    }
+
+
 @app.get("/sessions")
 async def list_sessions():
     result: Dict[str, Any] = {}
@@ -180,6 +209,7 @@ async def websocket_metrics(ws: WebSocket):
 
     session_id = uuid.uuid4().hex[:12]
     current_service: Any = None  # AIService or DemoService
+    start_task: Any = None
 
     # Helper to send JSON safely
     async def send(data: Dict[str, Any]) -> None:
@@ -197,6 +227,16 @@ async def websocket_metrics(ws: WebSocket):
 
     async def on_status(status: Dict[str, Any]) -> None:
         await send({"type": "system_status", "payload": status})
+
+    # Communication callbacks (chat, transcript, conversation state)
+    async def on_chat(msg: Any) -> None:
+        await send({"type": "chat", "data": msg.to_dict()})
+
+    async def on_transcript(entry: Any) -> None:
+        await send({"type": "transcript", "data": entry.to_dict()})
+
+    async def on_conversation_state(state: Any) -> None:
+        await send({"type": "conversation_state", "data": state.to_dict()})
 
     try:
         while True:
@@ -220,7 +260,10 @@ async def websocket_metrics(ws: WebSocket):
                 if not sdk_cfg.has_all_keys:
                     await send({
                         "type": "error",
-                        "message": "SDK keys not configured. Use demo mode instead.",
+                        "message": (
+                            "Live agent unavailable. Set STREAM_API_KEY, STREAM_API_SECRET, "
+                            "GEMINI_API_KEY, and ELEVENLABS_API_KEY."
+                        ),
                     })
                     continue
 
@@ -230,10 +273,33 @@ async def websocket_metrics(ws: WebSocket):
                         on_metrics=on_metrics,
                         on_feedback=on_feedback,
                         on_status=on_status,
+                        on_chat=on_chat,
+                        on_transcript=on_transcript,
+                        on_conversation_state=on_conversation_state,
                     )
-                    info = await service.start(call_id=call_id)
                     current_service = service
-                    await send({"type": "session_started", "data": info})
+                    await send({
+                        "type": "session_starting",
+                        "data": {
+                            "session_id": session_id,
+                            "call_id": call_id,
+                            "mode": "live",
+                        },
+                    })
+
+                    async def _start_live_session() -> None:
+                        try:
+                            info = await service.start(call_id=call_id)
+                            await send({"type": "session_started", "data": info})
+                        except Exception as e:
+                            logger.error(f"[{session_id}] Failed to start AI service: {e}")
+                            await registry.stop_service(session_id)
+                            await send({
+                                "type": "error",
+                                "message": f"Failed to start AI agent: {str(e)[:100]}",
+                            })
+
+                    start_task = asyncio.create_task(_start_live_session())
                 except Exception as e:
                     logger.error(f"[{session_id}] Failed to start AI service: {e}")
                     await registry.stop_service(session_id)
@@ -264,6 +330,14 @@ async def websocket_metrics(ws: WebSocket):
                 if current_service is None:
                     continue
 
+                if start_task and not start_task.done():
+                    start_task.cancel()
+                    try:
+                        await start_task
+                    except BaseException:
+                        pass
+                    start_task = None
+
                 if isinstance(current_service, DemoService):
                     summary = await current_service.stop()
                     _demo_services.pop(session_id, None)
@@ -272,6 +346,37 @@ async def websocket_metrics(ws: WebSocket):
 
                 current_service = None
                 await send({"type": "session_stopped", "data": summary})
+
+            # ── Send chat message to AI agent ──
+            elif msg_type == "send_message":
+                text = message.get("text", "").strip()
+                if not text:
+                    continue
+                if current_service is None:
+                    await send({"type": "error", "message": "No active session"})
+                    continue
+                if isinstance(current_service, DemoService):
+                    # In demo mode, echo back a simulated response
+                    await send({"type": "chat", "data": {
+                        "id": uuid.uuid4().hex[:8],
+                        "role": "user",
+                        "content": text,
+                        "timestamp": time.time(),
+                        "source": "text",
+                    }})
+                    await send({"type": "chat", "data": {
+                        "id": uuid.uuid4().hex[:8],
+                        "role": "assistant",
+                        "content": "I'm in demo mode. Start a live session to chat with the AI coach!",
+                        "timestamp": time.time(),
+                        "source": "demo",
+                    }})
+                else:
+                    try:
+                        await current_service.send_chat(text)
+                    except Exception as e:
+                        logger.debug(f"[{session_id}] Chat send error: {e}")
+                        await send({"type": "error", "message": "Failed to send message"})
 
             # ── Keepalive ──
             elif msg_type == "ping":
@@ -283,6 +388,13 @@ async def websocket_metrics(ws: WebSocket):
         logger.error(f"[{session_id}] WebSocket error: {e}", exc_info=True)
     finally:
         # Clean up on disconnect
+        if start_task and not start_task.done():
+            start_task.cancel()
+            try:
+                await start_task
+            except BaseException:
+                pass
+
         if current_service is not None:
             if isinstance(current_service, DemoService):
                 await current_service.stop()
@@ -298,7 +410,7 @@ async def websocket_metrics(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "server:app",
+        "backend.server:app",
         host=server_cfg.host,
         port=server_cfg.port,
         reload=True,

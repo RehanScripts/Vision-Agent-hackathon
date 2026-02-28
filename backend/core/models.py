@@ -59,6 +59,51 @@ class CoachingFeedback:
 
 
 # ---------------------------------------------------------------------------
+# Chat / Conversation models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChatMessage:
+    """A single message in the conversation between user and AI agent."""
+    id: str = ""
+    role: str = "assistant"      # "user" | "assistant" | "system"
+    content: str = ""
+    timestamp: float = field(default_factory=time.time)
+    source: str = "text"          # "text" | "voice" | "vision"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TranscriptEntry:
+    """A speech-to-text transcript segment from the call audio."""
+    speaker: str = ""             # participant id or "user" / "agent"
+    text: str = ""
+    timestamp: float = field(default_factory=time.time)
+    confidence: float = 1.0
+    is_final: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ConversationState:
+    """Tracks the live conversation state."""
+    is_user_speaking: bool = False
+    is_agent_speaking: bool = False
+    turn_count: int = 0
+    last_user_speech: str = ""
+    last_agent_response: str = ""
+    transcript_length: int = 0
+    context_summary: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
 # Session telemetry
 # ---------------------------------------------------------------------------
 
@@ -75,6 +120,10 @@ class SessionTelemetry:
     sdk_active: bool = False
     multimodal_active: bool = False
     agent_joined: bool = False
+    audio_active: bool = False
+    transcript_entries: int = 0
+    chat_messages: int = 0
+    conversation_turns: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

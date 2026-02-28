@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useMemo } from "react";
 import { motion } from "framer-motion";
 import GlassCard from "@/components/ui/GlassCard";
 import AnimatedNumber from "@/components/ui/AnimatedNumber";
@@ -32,11 +32,7 @@ const fadeUp = {
 };
 
 export default function AnalyticsPage() {
-  const [analytics, setAnalytics] = useState<AnalyticsOverview | null>(null);
-
-  useEffect(() => {
-    setAnalytics(computeAnalytics());
-  }, []);
+  const [analytics] = useState<AnalyticsOverview | null>(() => computeAnalytics());
 
   const statCards = useMemo(() => {
     if (!analytics) return [];

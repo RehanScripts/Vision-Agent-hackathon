@@ -7,7 +7,6 @@ import Badge from "@/components/ui/Badge";
 import {
   Mic,
   Video,
-  Timer,
   Target,
   Presentation,
   MessageSquare,

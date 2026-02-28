@@ -37,8 +37,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from .models import SpeakingMetrics
-from .config import processing_cfg
+from ..core.models import SpeakingMetrics
+from ..core.config import processing_cfg
 
 # -- Optional heavy imports --------------------------------------------------
 
@@ -53,11 +53,6 @@ except ImportError:
     aiortc = None  # type: ignore[assignment]
 
 try:
-    import cv2
-except ImportError:
-    cv2 = None  # type: ignore[assignment]
-
-try:
     import mediapipe as mp
 except ImportError:
     mp = None  # type: ignore[assignment]
@@ -66,8 +61,6 @@ try:
     from vision_agents.core.processors.base_processor import VideoProcessorPublisher
     from vision_agents.core.utils.video_forwarder import VideoForwarder
     from vision_agents.core.utils.video_track import QueuedVideoTrack
-    from vision_agents.core.events.manager import EventManager
-    from vision_agents.core.events.base import PluginBaseEvent
     _HAS_SDK = True
 except ImportError:
     _HAS_SDK = False
@@ -78,26 +71,10 @@ except ImportError:
         pass
     class QueuedVideoTrack:  # type: ignore[no-redef]
         pass
-    class EventManager:  # type: ignore[no-redef]
-        pass
-    class PluginBaseEvent:  # type: ignore[no-redef]
-        pass
+    pass
 
 
 logger = logging.getLogger("speakai.processor")
-
-
-# ---------------------------------------------------------------------------
-# Custom event: metrics produced by our processor
-# ---------------------------------------------------------------------------
-
-class MetricsProducedEvent(PluginBaseEvent if _HAS_SDK else object):  # type: ignore
-    """Fired every time the processor produces a new SpeakingMetrics."""
-    event_name = "metrics_produced"
-
-    def __init__(self, metrics: SpeakingMetrics, participant_id: Optional[str] = None):
-        self.metrics = metrics
-        self.participant_id = participant_id
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -126,7 +103,6 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
         self._video_forwarder: Optional[Any] = None
         self._video_track: Optional[Any] = None
         self._agent: Any = None
-        self._events: Optional[Any] = None
         self._shutdown = False
 
         # MediaPipe models (lazy-init in worker thread)
@@ -156,23 +132,9 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
     def latest(self) -> SpeakingMetrics:
         return self._latest_metrics
 
-    @property
-    def events(self) -> Any:
-        if self._events is None:
-            self._events = EventManager() if _HAS_SDK else None
-        return self._events
-
-    @events.setter
-    def events(self, value: Any) -> None:
-        self._events = value
-
     def attach_agent(self, agent: Any) -> None:
         """Called by Agent during init — gives us access to agent and event bus."""
         self._agent = agent
-        if _HAS_SDK:
-            if self._events is None:
-                self._events = EventManager()
-            self._events.register(MetricsProducedEvent)
         logger.info("SpeakingCoachProcessor attached to agent")
 
     def publish_video_track(self) -> Any:
@@ -262,10 +224,6 @@ class SpeakingCoachProcessor(VideoProcessorPublisher if _HAS_SDK else object):  
             self.last_latency_ms = round(elapsed_ms, 1)
             self.frames_processed += 1
             self._latest_metrics = metrics
-
-            # Fire event so Agent/server can consume metrics
-            if self._events is not None and _HAS_SDK:
-                self._events.send(MetricsProducedEvent(metrics=metrics))
 
             # Publish the (original) frame back into the call
             if self._video_track is not None:

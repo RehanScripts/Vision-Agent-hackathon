@@ -17,8 +17,8 @@ import logging
 import time
 from typing import Any, Optional
 
-from .models import SpeakingMetrics, CoachingFeedback
-from .config import processing_cfg
+from ..core.models import SpeakingMetrics, CoachingFeedback
+from ..core.config import processing_cfg
 
 logger = logging.getLogger("speakai.reasoning")
 
@@ -150,12 +150,12 @@ class ReasoningEngine:
         if agent is not None and hasattr(agent, "llm"):
             try:
                 prompt = (
-                    f"Speaker metrics — eye contact {metrics.eye_contact:.0f}%, "
-                    f"head stability {metrics.head_stability:.0f}%, "
+                    f"Speaker: eye {metrics.eye_contact:.0f}%, "
+                    f"stability {metrics.head_stability:.0f}%, "
                     f"posture {metrics.posture_score:.0f}%, "
                     f"engagement {metrics.facial_engagement:.0f}%, "
                     f"WPM {metrics.words_per_minute}. "
-                    "Give ONE short actionable coaching tip in ≤20 words."
+                    "ONE coaching tip in ≤15 words."
                 )
                 response = await asyncio.wait_for(
                     agent.llm.simple_response(prompt),

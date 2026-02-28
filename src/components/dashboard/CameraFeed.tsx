@@ -1,7 +1,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { useEffect, useCallback } from "react";
+import { useCallback } from "react";
 import Badge from "@/components/ui/Badge";
 import { ScanLine, VideoOff, Camera, AlertTriangle, Wifi, WifiOff } from "lucide-react";
 import { useWebcam } from "@/hooks/useWebcam";
@@ -10,34 +10,22 @@ import type { ConnectionStatus, SessionStatus } from "@/hooks/useMetricsStream";
 interface CameraFeedProps {
   connectionStatus?: ConnectionStatus;
   sessionStatus?: SessionStatus;
-  onFrame?: (base64Jpeg: string) => void;
   streaming?: boolean;
 }
 
 export default function CameraFeed({
   connectionStatus = "disconnected",
   sessionStatus = "idle",
-  onFrame,
-  streaming = false,
+  streaming: _streaming = false,
 }: CameraFeedProps) {
+  void _streaming;
   const {
     status: cameraStatus,
     error: cameraError,
     videoRef,
     startCamera,
     stopCamera,
-    startCapture,
-    stopCapture,
-  } = useWebcam({ captureFps: 5, jpegQuality: 0.5 });
-
-  useEffect(() => {
-    if (streaming && onFrame && cameraStatus === "active") {
-      startCapture(onFrame);
-    } else {
-      stopCapture();
-    }
-    return () => stopCapture();
-  }, [streaming, onFrame, cameraStatus, startCapture, stopCapture]);
+  } = useWebcam();
 
   const handleToggleCamera = useCallback(async () => {
     if (cameraStatus === "active") {

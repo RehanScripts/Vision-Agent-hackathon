@@ -1,18 +1,26 @@
 # SpeakAI — Real-Time AI Public Speaking Coach
 
-A premium, futuristic AI SaaS dashboard UI for a real-time public speaking coach. Built with Next.js, Tailwind CSS, Framer Motion, and Recharts.
-
-> ⚠️ This is a **UI-only** project. No backend logic is implemented yet.
+A premium AI-powered public speaking coach. The AI agent joins a Stream Video call as a real participant, analyses the speaker's video + audio via Vision Agents SDK (Gemini Realtime + ElevenLabs TTS), and provides real-time spoken coaching feedback.
 
 ## Tech Stack
 
-- **Next.js 16** (App Router)
+### Frontend
+- **Next.js 16** (App Router + Turbopack)
 - **TypeScript**
 - **Tailwind CSS v4**
 - **Framer Motion** — animations & transitions
+- **@stream-io/video-react-sdk** — live video calls
 - **Lucide React** — icon system
 - **Recharts** — analytics charts
 - **clsx + tailwind-merge** — utility class composition
+
+### Backend
+- **Python 3.13** + **FastAPI** / **Uvicorn**
+- **Vision Agents SDK** (`getstream`, `gemini`, `elevenlabs`, `ultralytics`)
+- **Gemini Realtime** — multimodal video+audio LLM
+- **ElevenLabs TTS** — spoken coaching responses
+- **MediaPipe** — per-frame face/pose analysis
+- **WebSocket** — real-time metrics streaming
 
 ## Pages
 
@@ -28,39 +36,81 @@ A premium, futuristic AI SaaS dashboard UI for a real-time public speaking coach
 ## Project Structure
 
 ```
-src/
-├── app/
-│   ├── layout.tsx              # Root layout
-│   ├── page.tsx                # Landing page
-│   ├── globals.css             # Global styles
-│   └── (dashboard)/
-│       ├── layout.tsx          # Dashboard shell (sidebar + topbar)
-│       ├── dashboard/page.tsx  # Live session
-│       ├── analytics/page.tsx  # Analytics
-│       ├── history/page.tsx    # Session history
-│       ├── practice/page.tsx   # Practice mode
-│       └── settings/page.tsx   # Settings
-├── components/
-│   ├── layout/
-│   │   ├── Sidebar.tsx         # Collapsible sidebar navigation
-│   │   └── Topbar.tsx          # Top navigation bar
-│   ├── ui/
-│   │   ├── GlassCard.tsx       # Reusable glass card component
-│   │   ├── AnimatedNumber.tsx  # Animated count-up numbers
-│   │   ├── Badge.tsx           # Status badges with variants
-│   │   └── MetricCard.tsx      # Metric display cards
-│   ├── dashboard/
-│   │   ├── CameraFeed.tsx      # Camera feed placeholder with effects
-│   │   └── FeedbackPanel.tsx   # AI feedback floating panel
-│   ├── analytics/
-│   │   └── PerformanceChart.tsx # Recharts performance line chart
-│   └── background/
-│       └── GradientBlobs.tsx   # Animated background blobs
-└── lib/
-    └── utils.ts                # cn() utility function
+├── .env.example             # Environment variable template
+├── next.config.ts           # Next.js configuration
+├── package.json             # Frontend dependencies
+│
+├── backend/                 # Python FastAPI backend
+│   ├── __init__.py
+│   ├── server.py            # FastAPI app — REST + WebSocket endpoints
+│   ├── requirements.txt     # Python dependencies
+│   ├── core/                # Configuration & data models
+│   │   ├── config.py        # Centralised settings from env vars
+│   │   └── models.py        # SpeakingMetrics, CoachingFeedback, SessionTelemetry
+│   ├── services/            # Session management
+│   │   ├── ai_service.py    # AI agent — joins Stream calls as participant
+│   │   ├── demo_service.py  # Simulated metrics fallback
+│   │   └── registry.py      # Session registry (maps session_id → service)
+│   └── processing/          # Video analysis & reasoning
+│       ├── processor.py     # SpeakingCoachProcessor (MediaPipe + VideoProcessorPublisher)
+│       └── reasoning.py     # ReasoningEngine + ThresholdFeedback
+│
+└── src/                     # Next.js frontend
+    ├── app/
+    │   ├── layout.tsx              # Root layout
+    │   ├── page.tsx                # Landing page
+    │   ├── globals.css             # Global styles & theme
+    │   └── (dashboard)/
+    │       ├── layout.tsx          # Dashboard shell (sidebar + topbar)
+    │       ├── dashboard/page.tsx  # Live session
+    │       ├── analytics/page.tsx  # Analytics
+    │       ├── history/page.tsx    # Session history
+    │       ├── practice/page.tsx   # Practice mode
+    │       └── settings/page.tsx   # Settings
+    ├── components/
+    │   ├── layout/
+    │   │   ├── Sidebar.tsx         # Collapsible sidebar navigation
+    │   │   └── Topbar.tsx          # Top navigation bar
+    │   ├── ui/
+    │   │   ├── GlassCard.tsx       # Reusable glass card component
+    │   │   ├── AnimatedNumber.tsx  # Animated count-up numbers
+    │   │   ├── Badge.tsx           # Status badges with variants
+    │   │   └── MetricCard.tsx      # Metric display cards
+    │   ├── dashboard/
+    │   │   ├── CameraFeed.tsx      # Local webcam preview with overlays
+    │   │   └── StreamCallPanel.tsx # Stream Video call UI (agent joins here)
+    │   ├── analytics/
+    │   │   └── PerformanceChart.tsx # Recharts performance line chart
+    │   └── background/
+    │       └── GradientBlobs.tsx   # Animated background blobs
+    ├── hooks/
+    │   ├── useMetricsStream.ts     # WebSocket hook for real-time metrics
+    │   └── useWebcam.ts            # getUserMedia webcam management
+    └── lib/
+        ├── sessionStore.ts         # localStorage session persistence & analytics
+        └── utils.ts                # cn() utility function
 ```
 
 ## Getting Started
+
+### 1. Environment variables
+
+Copy `.env.example` → `.env` and fill in your keys:
+
+```bash
+cp .env.example .env
+```
+
+### 2. Backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+cd ..
+uvicorn backend.server:app --reload --host 0.0.0.0 --port 8080
+```
+
+### 3. Frontend
 
 ```bash
 npm install

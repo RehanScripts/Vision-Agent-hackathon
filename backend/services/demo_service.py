@@ -14,9 +14,9 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 
-from .models import SpeakingMetrics, CoachingFeedback, SessionTelemetry
-from .reasoning_engine import ThresholdFeedback
-from .config import processing_cfg
+from ..core.models import SpeakingMetrics, CoachingFeedback, SessionTelemetry
+from ..processing.reasoning import ThresholdFeedback
+from ..core.config import processing_cfg
 
 logger = logging.getLogger("speakai.demo")
 

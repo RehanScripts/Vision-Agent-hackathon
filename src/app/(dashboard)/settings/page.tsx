@@ -13,7 +13,7 @@ import {
   ChevronDown,
   Check,
 } from "lucide-react";
-import { getSettings, saveSettings, UserSettings } from "@/lib/sessionStore";
+import { getSettings, saveSettings } from "@/lib/sessionStore";
 
 function Toggle({
   enabled,
@@ -107,10 +107,12 @@ export default function SettingsPage() {
   // Load persisted settings on mount
   useEffect(() => {
     const s = getSettings();
-    setCameraPreview(s.cameraPreview);
-    setInterruptions(s.interruptions);
-    setDarkMode(s.darkMode);
-    setSessionType(s.sessionType);
+    queueMicrotask(() => {
+      setCameraPreview(s.cameraPreview);
+      setInterruptions(s.interruptions);
+      setDarkMode(s.darkMode);
+      setSessionType(s.sessionType);
+    });
   }, []);
 
   const handleSave = () => {

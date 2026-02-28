@@ -3,8 +3,6 @@
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
 import { Camera, Mic, User } from "lucide-react";
-import Badge from "@/components/ui/Badge";
-import { useEffect, useState } from "react";
 
 const pageTitles: Record<string, string> = {
   "/dashboard": "Live Session",
@@ -17,24 +15,6 @@ const pageTitles: Record<string, string> = {
 export default function Topbar() {
   const pathname = usePathname();
   const title = pageTitles[pathname] || "Dashboard";
-
-  const [timer, setTimer] = useState(0);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTimer((prev) => prev + 1);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const formatTime = (seconds: number) => {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    return `${h.toString().padStart(2, "0")}:${m
-      .toString()
-      .padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-  };
 
   return (
     <motion.header
@@ -77,14 +57,6 @@ export default function Topbar() {
           </div>
           <span className="hidden sm:inline text-white/40 text-xs">Mic</span>
         </div>
-
-        {/* Divider */}
-        <div className="h-6 w-px bg-white/[0.08]" />
-
-        {/* Session Timer */}
-        <Badge variant="blue" pulse>
-          <span className="font-mono text-xs">{formatTime(timer)}</span>
-        </Badge>
 
         {/* Divider */}
         <div className="h-6 w-px bg-white/[0.08]" />

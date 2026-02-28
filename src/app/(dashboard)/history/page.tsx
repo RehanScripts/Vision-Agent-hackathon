@@ -1,13 +1,12 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { motion } from "framer-motion";
 import GlassCard from "@/components/ui/GlassCard";
 import Badge from "@/components/ui/Badge";
 import {
   Clock,
   TrendingUp,
-  TrendingDown,
   Calendar,
   ChevronRight,
   Play,
@@ -49,11 +48,7 @@ const fadeUp = {
 };
 
 export default function HistoryPage() {
-  const [sessions, setSessions] = useState<StoredSession[]>([]);
-
-  useEffect(() => {
-    setSessions(getSessions());
-  }, []);
+  const [sessions, setSessions] = useState<StoredSession[]>(() => getSessions());
 
   const handleClear = () => {
     clearSessions();

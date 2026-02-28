@@ -1,5 +1,5 @@
 # Vision Agents SDK + Plugins (the AI agent that joins Stream Video calls)
-vision-agents[getstream,gemini,deepgram,elevenlabs,ultralytics]
+vision-agents[getstream,gemini,elevenlabs,ultralytics]
 
 # Web server — serves the frontend-facing WebSocket + REST
 fastapi[standard]
@@ -8,9 +8,10 @@ websockets
 
 # Environment
 python-dotenv
+pyjwt
+certifi
 
 # Computer Vision (used inside SpeakingCoachProcessor for per-frame analysis)
-opencv-python-headless
 numpy
 mediapipe
 
@@ -18,5 +19,4 @@ mediapipe
 av
 
 # WebRTC — required by Vision Agents SDK edge transport
-aiortc
 aiortc

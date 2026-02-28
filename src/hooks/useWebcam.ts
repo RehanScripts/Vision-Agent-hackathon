@@ -3,7 +3,6 @@
  *
  * Manages getUserMedia webcam access with:
  * - Permission state tracking
- * - Frame capture at configurable FPS for WebSocket streaming
  * - Graceful error handling with user-friendly messages
  * - Cleanup on unmount
  */
@@ -23,31 +22,18 @@ export interface UseWebcamOptions {
   width?: number;
   /** Desired height */
   height?: number;
-  /** Capture FPS for frame extraction */
-  captureFps?: number;
   /** Auto-start on mount */
   autoStart?: boolean;
-  /** JPEG quality (0-1) */
-  jpegQuality?: number;
 }
 
 export function useWebcam(options: UseWebcamOptions = {}) {
-  const {
-    width = 1280,
-    height = 720,
-    captureFps = 5,
-    autoStart = false,
-    jpegQuality = 0.6,
-  } = options;
+  const { width = 1280, height = 720, autoStart = false } = options;
 
   const [status, setStatus] = useState<CameraStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const onFrameRef = useRef<((base64: string) => void) | null>(null);
 
   // -- Start Camera ----------------------------------------------------------
 
@@ -94,11 +80,6 @@ export function useWebcam(options: UseWebcamOptions = {}) {
   // -- Stop Camera -----------------------------------------------------------
 
   const stopCamera = useCallback(() => {
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
-
     if (stream) {
       stream.getTracks().forEach((track) => track.stop());
       setStream(null);
@@ -111,54 +92,6 @@ export function useWebcam(options: UseWebcamOptions = {}) {
     setStatus("idle");
     setError(null);
   }, [stream]);
-
-  // -- Frame Capture ---------------------------------------------------------
-
-  const startCapture = useCallback(
-    (onFrame: (base64: string) => void) => {
-      onFrameRef.current = onFrame;
-
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-      }
-
-      // Create hidden canvas for frame extraction
-      if (!canvasRef.current) {
-        canvasRef.current = document.createElement("canvas");
-      }
-
-      const interval = 1000 / captureFps;
-
-      captureIntervalRef.current = setInterval(() => {
-        const video = videoRef.current;
-        const canvas = canvasRef.current;
-        if (!video || !canvas || video.readyState < 2) return;
-
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-
-        ctx.drawImage(video, 0, 0);
-        const dataUrl = canvas.toDataURL("image/jpeg", jpegQuality);
-        // Strip the data:image/jpeg;base64, prefix
-        const base64 = dataUrl.split(",")[1];
-        if (base64 && onFrameRef.current) {
-          onFrameRef.current(base64);
-        }
-      }, interval);
-    },
-    [captureFps, jpegQuality]
-  );
-
-  const stopCapture = useCallback(() => {
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
-    onFrameRef.current = null;
-  }, []);
 
   // -- Lifecycle -------------------------------------------------------------
 
@@ -184,7 +117,5 @@ export function useWebcam(options: UseWebcamOptions = {}) {
     // Actions
     startCamera,
     stopCamera,
-    startCapture,
-    stopCapture,
   };
 }
